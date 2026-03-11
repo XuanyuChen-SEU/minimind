@@ -74,7 +74,7 @@ class MokioMindConfig(PretrainedConfig):
 import torch
 import torch.nn as nn
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 # RMSNorm的实现
 class RMSNorm(nn.Module):
@@ -164,25 +164,20 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+def repeat_kv(x : torch.Tensor, n_rep : int) -> torch.Tensor:
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1:
         return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
-        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
-    )
+    x = x[..., None, :, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+    return x.reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+
 
 class Attention(nn.Module):
-    def __init__(self, args: MokioMindConfig):
+    def __init__(self, args : MokioMindConfig):
         super().__init__()
+        
+        self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
 
-        self.num_key_value_heads = (
-            args.num_attention_heads
-            if args.num_key_value_heads is None
-            else args.num_attention_heads
-        )
         assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
 
         self.n_local_heads = args.num_attention_heads
@@ -198,7 +193,30 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
-        self.flash = (
-            hasattr(torch.nn.functional, "scaled_dot_product_attention")
-            and args.flash_attention
+
+        self.flash = getattr(torch.nn.functional, "scaled_dot_product_attention") and args.flash_attention
+        
+    def forward(self, x : torch.Tensor, position_embeddings : Tuple[torch.Tensor, torch.Tensor], past_key_value : Optional[Tuple[torch.Tensor, torch.Tensor]] = None, use_cache : bool = False, attention_mask : Optional[torch.Tensor] = None):
+        bsz, sql_len, _ = x.shape
+        xq, xk, xv = (self.q_proj(x), self.k_proj(x), self.v_proj(x))
+
+        q = xq.view(bsz, sql_len, self.n_local_heads, self.head_dim)
+        k = xk.view(bsz, sql_len, self.n_local_kv_heads, self.head_dim)
+        v = xv.view(bsz, sql_len, self.n_local_kv_heads, self.head_dim)
+
+        cos, sin = position_embeddings
+        xq, xk = apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1)
+
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None
+
+        xq, xk, xv = (
+            xq.transpose(1, 2),
+            # [bsz, sql_len, n_local_heads, head_dim] -> [bsz, n_local_heads, sql_len, head_dim]
+            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            repeat_kv(xv, self.n_rep).transpose(1, 2),
         )
+
+        # 进行attention计算 q * k^T / sqrt(d)
