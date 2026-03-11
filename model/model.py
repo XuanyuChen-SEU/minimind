@@ -94,7 +94,7 @@ def precompute_freqs_cls(dim : int, end : int = int(32 * 1024), rope_base : floa
     # 初始化标准 RoPE 频率。
     freqs, attn_factor = ( 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0)
 
-    # 如果rope_scaling不为空，则使用rope_scaling中的参数,也就是考虑yarn
+    # 如果rope_scaling不为空，则使用rope_scaling中的参数,也就是考虑YaRN
     if rope_scaling is not None:
         orig_max, factor, beta_fast, beta_slow, attn_factor = (
             rope_scaling.get("original_max_position_embeddings", 2048),
@@ -162,3 +162,43 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
     )
     return q_embed, k_embed
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    )
+
+class Attention(nn.Module):
+    def __init__(self, args: MokioMindConfig):
+        super().__init__()
+
+        self.num_key_value_heads = (
+            args.num_attention_heads
+            if args.num_key_value_heads is None
+            else args.num_attention_heads
+        )
+        assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
+
+        self.n_local_heads = args.num_attention_heads
+        self.n_local_kv_heads = self.num_key_value_heads
+        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = args.hidden_size // args.num_attention_heads
+
+        self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+
+        self.attn_dropout = nn.Dropout(args.dropout)
+        self.resid_dropout = nn.Dropout(args.dropout)
+        self.dropout = args.dropout
+        self.flash = (
+            hasattr(torch.nn.functional, "scaled_dot_product_attention")
+            and args.flash_attention
+        )
