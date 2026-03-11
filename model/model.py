@@ -71,9 +71,11 @@ class MokioMindConfig(PretrainedConfig):
             else None
         )
 
+import math
 import torch
 import torch.nn as nn
-import math
+import torch.nn.functional as F
+
 from typing import Optional, Tuple
 
 # RMSNorm的实现
@@ -197,12 +199,12 @@ class Attention(nn.Module):
         self.flash = getattr(torch.nn.functional, "scaled_dot_product_attention") and args.flash_attention
         
     def forward(self, x : torch.Tensor, position_embeddings : Tuple[torch.Tensor, torch.Tensor], past_key_value : Optional[Tuple[torch.Tensor, torch.Tensor]] = None, use_cache : bool = False, attention_mask : Optional[torch.Tensor] = None):
-        bsz, sql_len, _ = x.shape
+        bsz, seq_len, _ = x.shape
         xq, xk, xv = (self.q_proj(x), self.k_proj(x), self.v_proj(x))
 
-        q = xq.view(bsz, sql_len, self.n_local_heads, self.head_dim)
-        k = xk.view(bsz, sql_len, self.n_local_kv_heads, self.head_dim)
-        v = xv.view(bsz, sql_len, self.n_local_kv_heads, self.head_dim)
+        q = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        k = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        v = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1)
@@ -214,9 +216,45 @@ class Attention(nn.Module):
 
         xq, xk, xv = (
             xq.transpose(1, 2),
-            # [bsz, sql_len, n_local_heads, head_dim] -> [bsz, n_local_heads, sql_len, head_dim]
+            # [bsz, seq_len, n_local_heads, head_dim] -> [bsz, n_local_heads, seq_len, head_dim]
             repeat_kv(xk, self.n_rep).transpose(1, 2),
             repeat_kv(xv, self.n_rep).transpose(1, 2),
         )
 
         # 进行attention计算 q * k^T / sqrt(d)
+        if self.flash and seq_len > 1 and past_key_value is None and (attention_mask is None 
+        or torch.all(attention_mask == 1)):
+            attn_mask = (
+                None
+                if attention_mask is None
+                else attention_mask.view(bsz, 1, 1, -1).expand(bsz, 
+                self.n_local_heads, seq_len, -1).bool()
+            )
+            output = F.scaled_dot_product_attention(
+                xq,
+                xk,
+                xv,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True,
+                attn_mask=attn_mask,
+            )
+        else:
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores = scores + torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
+                diagonal=1,
+            )
+            if attention_mask is not None:
+                extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                scores = scores + extended_attention_mask
+
+            # softmax归一化
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = scores @ xv
+        
+        output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
+    
