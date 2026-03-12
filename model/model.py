@@ -76,7 +76,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
-from transformers import PretrainedModel, GenerationMixin
+from transformers import PreTrainedModel, GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from typing import Optional, Tuple, Union
 
@@ -185,8 +185,7 @@ class Attention(nn.Module):
         assert args.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
 
         self.n_local_heads = args.num_attention_heads
-        self.n_local_kv_heads = self.num_key_value_heads
-        self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        self.n_rep = self.n_local_heads // self.num_key_value_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
 
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
@@ -308,6 +307,7 @@ class MokioMindBlock(nn.Module):
 class MokioMindModel(nn.Module):
     def __init__(self, config: MokioMindConfig):
         super().__init__()
+        self.config = config
         self.vocab_size, self.num_hidden_layers = (
             config.vocab_size, config.num_hidden_layers
         )
@@ -370,7 +370,7 @@ class MokioMindModel(nn.Module):
         hidden_states = self.norm(hidden_states)
         return hidden_states, presents
 
-class MokioMindForCausalLM(PretrainedModel, GenerationMixin):
+class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MokioMindConfig
 
     def __init__(self, config: MokioMindConfig):
@@ -383,8 +383,6 @@ class MokioMindForCausalLM(PretrainedModel, GenerationMixin):
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
         self.model.embed_tokens.weight = self.lm_head.weight
-
-        self.OUT = CausalLMOutputWithPast()
 
     def forward(self, input_ids: torch.Tensor, 
     attention_mask: Optional[torch.Tensor] = None, 
@@ -403,9 +401,9 @@ class MokioMindForCausalLM(PretrainedModel, GenerationMixin):
         slice_indices = (slice(-logits_to_keep) if isinstance(logits_to_keep, int) else logits_to_keep)
         logits = self.lm_head(hidden_states[:, slice_indices, :])
 
-        self.OUT.__setitem__("last_hidden_state", hidden_states)
-        self.OUT.__setitem__("past_key_values", past_key_values)
-        self.OUT.__setitem__("logits", logits)
-        
-        return self.OUT
+        return CausalLMOutputWithPast(
+            logits = logits,
+            past_key_values = past_key_values,
+            hidden_states = hidden_states,
+        )
 
