@@ -11,3 +11,6 @@ wheels/
 
 # other files
 MokioMind/
+
+# dataset
+dataset/*.jsonl
