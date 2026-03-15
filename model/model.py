@@ -168,11 +168,12 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-def repeat_kv(x : torch.Tensor, n_rep : int) -> torch.Tensor:
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1:
         return x
-    x = x[..., None, :, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+    # 在 head_dim 前插入一维，再 expand 成 n_rep，得到 [bs, slen, num_kv_heads, n_rep, head_dim]
+    x = x[..., None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim)
     return x.reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
 
 
@@ -204,11 +205,12 @@ class Attention(nn.Module):
         xq, xk, xv = (self.q_proj(x), self.k_proj(x), self.v_proj(x))
 
         q = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
-        k = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
-        v = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        k = xk.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
+        v = xv.view(bsz, seq_len, self.num_key_value_heads, self.head_dim)
 
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1)
+        xv = v  # 保持 4D，与 xk 一致，供 repeat_kv 与 past_kv 使用
 
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
