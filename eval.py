@@ -4,8 +4,8 @@ import warnings
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
-from model.MokioModel import MokioMindConfig, MokioMindForCausalLM
-from model.model_lora import apply_lora, load_lora  # ！修正：原缺少LoRA加载支持
+from model.model import MokioMindConfig, MokioMindForCausalLM
+# from model.model_lora import apply_lora, load_lora  # ！修正：原缺少LoRA加载支持
 from trainer.trainer_utils import setup_seed
 
 warnings.filterwarnings("ignore")
