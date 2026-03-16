@@ -1,3 +1,23 @@
+"""
+lm_dataset.py —— 语言模型训练用数据集封装
+
+在项目中的角色：
+  - 被 trainer 直接使用：train_pretrain.py 使用 PretrainDataset；train_full_sft.py 使用 SFTDataset。
+  - DPODataset、RLAIFDataset 供 DPO/PPO/GRPO 等脚本使用（若存在），与 model/、eval 无直接依赖。
+  - 数据格式与 model 目录下 tokenizer 一致（BOS/EOS/PAD、chat 模板等），与 MokioMind 文件夹无关。
+
+提供四类 Dataset，对应不同训练阶段与目标：
+
+  1. PretrainDataset：自回归预训练，Next-Token Prediction，整段文本参与 loss。
+  2. SFTDataset：监督微调，仅 assistant 回复部分参与 loss（稀疏 label）。
+  3. DPODataset：DPO 偏好学习，每条样本返回 chosen/rejected 两套序列与 mask。
+  4. RLAIFDataset：RL（PPO/GRPO）用，只返回原始 prompt/answer 字符串，由 trainer 在线 tokenize。
+
+统一约定：
+  - 数据文件均为 JSON/JSONL，通过 HuggingFace load_dataset("json", data_files=...) 惰性加载。
+  - 除 RLAIFDataset 外，__getitem__ 返回的序列长度均为 max_length（右侧 PAD 补齐）。
+  - attention_mask：1=有效 token，0=padding，用于 attention 层屏蔽，形状与对应 input_ids 一致。
+"""
 from torch.utils.data import Dataset
 import torch
 import os
@@ -73,11 +93,20 @@ def post_processing_chat(prompt_content, empty_think_ratio=0.05):
 #   - labels 直接 clone 自 input_ids（即 X 和 Y 错位一格：Y[t] = X[t+1]）。
 # ──────────────────────────────────────────────────────────────────────────────
 class PretrainDataset(Dataset):
+    """
+    自回归预训练数据集。每条样本返回 (input_ids, labels, attention_mask)。
+
+    返回张量形状（每条样本）：
+      - input_ids:   [max_length]，dtype long，含 BOS + 正文 token + EOS + PAD
+      - labels:      [max_length]，与 input_ids 错位一格语义（Y[t]=X[t+1]），PAD 处为 -100
+      - attention_mask: [max_length]，1=有效，0=padding
+    """
+
     def __init__(self, data_path, tokenizer, max_length=512):
         super().__init__()
+        # tokenizer 需与 model 目录下 eval/train 使用的 tokenizer 一致（同一 vocab、BOS/EOS/PAD id）
         self.tokenizer = tokenizer
         self.max_length = max_length
-        # 使用 HuggingFace datasets 的惰性加载，避免一次性读入大文件
         self.samples = load_dataset("json", data_files=data_path, split="train")
 
     def __len__(self):
@@ -87,6 +116,7 @@ class PretrainDataset(Dataset):
         sample = self.samples[index]
 
         # Step 1：tokenize 原始文本，留出首尾各 1 个 token 的位置给 BOS/EOS
+        # 得到 list of token id，长度 ≤ max_length - 2
         tokens = self.tokenizer(
             str(sample["text"]),
             add_special_tokens=False,
@@ -94,10 +124,11 @@ class PretrainDataset(Dataset):
             truncation=True,
         ).input_ids
 
-        # Step 2：拼接 BOS + token序列 + EOS，构成完整序列
+        # Step 2：拼接 BOS + token序列 + EOS，构成完整序列（长度 ≤ max_length）
         tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
 
         # Step 3：右侧用 PAD 补齐到 max_length，保证 batch 内等长
+        # 形状：list 长度 max_length → 转 tensor [max_length]
         input_ids = tokens + [self.tokenizer.pad_token_id] * (
             self.max_length - len(tokens)
         )
@@ -105,6 +136,7 @@ class PretrainDataset(Dataset):
 
         # Step 4：labels 与 input_ids 完全相同，但 PAD 位置置 -100，
         #         CrossEntropyLoss 会自动忽略 -100，不计入 loss
+        # 训练时通常用 labels 作为 target，input_ids 作为输入，即 Y[t] = X[t+1] 在 loss 中体现
         labels = input_ids.clone()
         labels[input_ids == self.tokenizer.pad_token_id] = -100
 
@@ -128,18 +160,28 @@ class PretrainDataset(Dataset):
 #   - 与 PretrainDataset 的关键区别：标签是"稀疏"的，只有 assistant 部分非 -100。
 # ──────────────────────────────────────────────────────────────────────────────
 class SFTDataset(Dataset):
+    """
+    监督微调数据集。每条样本返回 (input_ids, labels, attention_mask)。
+
+    返回张量形状（每条样本）：
+      - input_ids:      [max_length]，完整对话 token 序列（user+assistant），右侧 PAD
+      - labels:         [max_length]，仅 assistant 回复位置为真实 token id，其余 -100
+      - attention_mask: [max_length]，1=非 PAD，0=PAD
+    """
+
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
         super().__init__()
+        # tokenizer 与 model 目录一致；max_length 与 train_full_sft 的 --max_seq_len 对应
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = load_dataset("json", data_files=jsonl_path, split="train")
         # 预先 tokenize assistant 回复的起始标记（BOS + "assistant\n"）
-        # 用于在 generate_labels 中定位每段 assistant 回复的开始位置
+        # 用于在 generate_labels 中定位每段 assistant 回复的开始位置；bos_id 为 list of int
         self.bos_id = tokenizer(
             f"{tokenizer.bos_token}assistant\n", add_special_tokens=False
         ).input_ids
         # 预先 tokenize assistant 回复的结束标记（EOS + "\n"）
-        # 用于在 generate_labels 中定位每段 assistant 回复的结束位置
+        # 用于在 generate_labels 中定位每段 assistant 回复的结束位置；eos_id 为 list of int
         self.eos_id = tokenizer(
             f"{tokenizer.eos_token}\n", add_special_tokens=False
         ).input_ids
@@ -149,7 +191,12 @@ class SFTDataset(Dataset):
 
     def create_chat_prompt(self, conversations):
         """
-        将多轮对话转换为模型输入的字符串。
+        将多轮对话转换为模型输入的字符串（未 tokenize）。
+
+        参数：
+          conversations: list of {"role": str, "content": str, ...}，可含 "functions"
+        返回：
+          str，即 apply_chat_template 渲染后的整段文本。
 
         特点：
         - 复制原始 conversations，防止修改原始数据。
@@ -175,6 +222,9 @@ class SFTDataset(Dataset):
     def generate_labels(self, input_ids):
         """
         生成 SFT 训练所需的稀疏标签序列。
+
+        参数：input_ids — list of int，长度 max_length（与 __getitem__ 中 tokenize 后的序列一致）
+        返回：labels — list of int，长度与 input_ids 相同，非 assistant 位置为 -100
 
         算法逻辑（滑动窗口扫描）：
         1. 初始化全 -100 的 labels，默认所有位置不计算 loss。
@@ -218,10 +268,11 @@ class SFTDataset(Dataset):
         prompt = post_processing_chat(prompt)
 
         # Step 4：tokenize 并截断到 max_length，不足则右侧 PAD 补齐
+        # input_ids 为 list，长度 = min(实际 token 数, max_length)，再 pad 到 max_length
         input_ids = self.tokenizer(prompt).input_ids[: self.max_length]
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
 
-        # Step 5：生成稀疏标签，只有 assistant 回复部分有有效 label
+        # Step 5：生成稀疏标签，只有 assistant 回复部分有有效 label（与 input_ids 等长）
         labels = self.generate_labels(input_ids)
         # # === 调试打印 ===
         # print(f"\n--- Sample {index} ---")
@@ -229,7 +280,7 @@ class SFTDataset(Dataset):
         #     print(f"{i:3d}: X={self.tokenizer.decode([x])!r:16s} ---> Y={self.tokenizer.decode([input_ids[i+1]])!r:16s} label={y}")
         # # ================
 
-        # ！修正：返回 attention_mask，使 attention 层能屏蔽 padding token
+        # ！修正：返回 attention_mask，使 attention 层能屏蔽 padding token；形状均为 [max_length]
         attention_mask = (
             torch.tensor(input_ids, dtype=torch.long) != self.tokenizer.pad_token_id
         ).long()
@@ -258,6 +309,16 @@ class SFTDataset(Dataset):
 #   - max_length 默认 4096，比 SFT 更长，因为 DPO 数据通常包含完整对话上下文。
 # ──────────────────────────────────────────────────────────────────────────────
 class DPODataset(Dataset):
+    """
+    DPO 偏好学习数据集。每条样本返回一个 dict，含 chosen/rejected 两套序列与 mask。
+
+    返回张量形状（每条样本，均为 1D）：
+      - x_chosen / x_rejected:     [max_length-1]，自回归输入（序列去掉最后一个 token）
+      - y_chosen / y_rejected:     [max_length-1]，自回归目标（序列去掉第一个 token），即 Y[t]=X[t+1]
+      - mask_chosen / mask_rejected: [max_length-1]，仅 assistant 回复对应位置为 1，与 y 对齐
+      - attention_mask_*:          [max_length-1]，1=非 PAD，0=PAD
+    """
+
     def __init__(self, file_path, tokenizer, max_length=4096):
         super().__init__()
         self.tokenizer = tokenizer
@@ -296,6 +357,7 @@ class DPODataset(Dataset):
         rejected_prompt = post_processing_chat(rejected_prompt)
 
         # Step 2：tokenize 并 padding 到 max_length（统一序列长度，方便 batch）
+        # chosen_encoding / rejected_encoding 的 input_ids 长度均为 max_length
         chosen_encoding = self.tokenizer(
             chosen_prompt,
             truncation=True,
@@ -309,15 +371,15 @@ class DPODataset(Dataset):
             padding="max_length",
         )
 
-        chosen_input_ids = chosen_encoding["input_ids"]
-        # Step 3：生成 loss mask，只有 assistant 回复部分为 1
+        chosen_input_ids = chosen_encoding["input_ids"]  # list, len = max_length
+        # Step 3：生成 loss mask，只有 assistant 回复部分为 1，长度 max_length
         chosen_loss_mask = self.generate_loss_mask(chosen_input_ids)
 
         rejected_input_ids = rejected_encoding["input_ids"]
         rejected_loss_mask = self.generate_loss_mask(rejected_input_ids)
 
         # Step 4：构造自回归训练对，x=[:-1] 作为输入，y=[1:] 作为目标
-        #         mask=[1:] 与 y 对齐，决定哪些位置的 loss 计入梯度
+        #         mask=[1:] 与 y 对齐，决定哪些位置的 loss 计入梯度；形状均为 [max_length-1]
         x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
         y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
         mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)
@@ -347,6 +409,9 @@ class DPODataset(Dataset):
     def generate_loss_mask(self, input_ids):
         """
         生成 DPO 训练所需的 loss mask（0/1 二值序列）。
+
+        参数：input_ids — list of int，长度 max_length（chosen 或 rejected 的 token 序列）
+        返回：loss_mask — list of int (0 或 1)，长度与 input_ids 相同
 
         与 SFTDataset.generate_labels 逻辑完全相同，区别在于：
         - SFT 返回的是具体的 token id（用于 CE loss）
@@ -393,6 +458,16 @@ class DPODataset(Dataset):
 #     这是 RL 数据集与 SL 数据集（返回 tensor）的最显著差异。
 # ──────────────────────────────────────────────────────────────────────────────
 class RLAIFDataset(Dataset):
+    """
+    RL（PPO/GRPO）用数据集。不做 tokenize，只返回原始字符串。
+
+    返回（每条样本）：dict {"prompt": str, "answer": str}
+      - prompt:  对话上文经 apply_chat_template 渲染后的字符串（含 add_generation_prompt）
+      - answer:  最后一条 assistant 回复的原文，用作参考答案/奖励计算
+
+    与 Pretrain/SFT/DPO 的区别：不返回任何张量，由 RL trainer 在线 tokenize 并 rollout。
+    """
+
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
         super().__init__()
         self.tokenizer = tokenizer
@@ -412,6 +487,9 @@ class RLAIFDataset(Dataset):
     def create_chat_prompt(self, conversations):
         """
         从对话列表中分离 prompt（上文）和 answer（参考答案）。
+
+        参数：conversations — list of {"content": "..."}，奇数索引为 user，偶数索引为 assistant
+        返回：(prompt: str, answer: str)
 
         处理逻辑：
         1. 按奇偶索引为每条消息分配 user/assistant 角色。
@@ -438,7 +516,7 @@ class RLAIFDataset(Dataset):
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        # 返回原始字符串，不做 tokenize，由 RL trainer 在线处理
+        # 返回原始字符串，不做 tokenize，由 RL trainer 在线处理；无张量形状，仅 str
         prompt, answer = self.create_chat_prompt(sample["conversations"])
 
         return {"prompt": prompt, "answer": answer}

@@ -1,3 +1,22 @@
+"""
+train_pretrain.py —— MokioMind 自回归预训练脚本
+
+在项目中的角色：
+  - 训练流水线第一步：通常 from_weight=none 从头训练，或加载既有 pretrain 权重继续预训练。
+  - 使用 dataset.lm_dataset.PretrainDataset（数据格式 {"text": "..."}）、model.model.MokioMindConfig、trainer_utils 的 init_model/lm_checkpoint 等。
+  - 运行方式：python -m trainer.train_pretrain [--data_path ../dataset/xxx.jsonl] [--from_weight none]；输出权重可被 train_full_sft 的 --from_weight pretrain 使用。
+
+流程概览：
+  1. 解析参数（保存路径、epochs、batch_size、学习率、混合精度、模型尺寸、数据路径、from_weight/from_resume 等）
+  2. init_distributed_mode / setup_seed
+  3. 构建 MokioMindConfig，可选从 lm_checkpoint 加载断点（resume）
+  4. 设置 autocast（bfloat16/float16）、可选 wandb
+  5. init_model、PretrainDataset、DistributedSampler、GradScaler、AdamW；若有 ckp_data 恢复模型/优化器/scaler 与 start_epoch/start_step
+  6. 可选 DDP 包装（忽略 freqs_cos/freqs_sin）
+  7. 每 epoch：设置 sampler epoch；若断点续训则用 SkipBatchSampler 跳过前 start_step 个 batch；DataLoader + train_epoch
+
+训练逻辑：PretrainDataset 返回 (input_ids, labels, attention_mask)；前向时传入 labels 做 CE loss（模型内部 shift），梯度累积后 clip_grad_norm、scaler.step、按间隔保存与打日志。
+"""
 import os
 import sys
 
@@ -5,19 +24,19 @@ import sys
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import argparse  # 命令行参数解析
-import time  # 时间统计
-import warnings  # 警告控制
+import argparse
+import time
+import warnings
 import torch
-import torch.distributed as dist  # 分布式训练支持
-from contextlib import nullcontext  # 上下文管理器
-from torch import optim  # 优化器
-from torch.nn.parallel import DistributedDataParallel  # 分布式数据并行
-from torch.utils.data import DataLoader, DistributedSampler  # 数据加载器
+import torch.distributed as dist
+from contextlib import nullcontext
+from torch import optim
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
 
 from model.model import MokioMindConfig
 from dataset.lm_dataset import PretrainDataset
-from trainer.trainer_utils import (  # 训练工具函数
+from trainer.trainer_utils import (
     get_lr,
     Logger,
     is_main_process,
@@ -28,17 +47,20 @@ from trainer.trainer_utils import (  # 训练工具函数
     SkipBatchSampler,
 )
 
-# 忽略警告信息，保持输出清洁
 warnings.filterwarnings("ignore")
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+    """
+    执行一个 epoch 的预训练。loader 每步产出 (input_ids, labels, attention_mask)，形状 [batch_size, max_seq_len]。
+    学习率按 get_lr 余弦退火；loss 做梯度累积后 clip、scaler.step；按 log_interval 打日志、save_interval 保存 checkpoint。
+    """
     start_time = time.time()
 
-    for step, batch in enumerate(loader, start=start_step + 1):
-        input_ids = batch["input_ids"].to(args.device)
-        attention_mask = batch["attention_mask"].to(args.device)
-        labels = batch["labels"].to(args.device)
+    for step, (input_ids, labels, attention_mask) in enumerate(loader, start=start_step + 1):
+        input_ids = input_ids.to(args.device)
+        attention_mask = attention_mask.to(args.device)
+        labels = labels.to(args.device)
 
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
@@ -46,7 +68,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         with autocast_ctx:
             res = model(input_ids, attention_mask=attention_mask, labels=labels)
-            loss = res.loss #+ res.aux_loss # 没有辅助损失
+            loss = res.loss  # 预训练不加 MoE aux_loss
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -62,9 +84,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps  # 恢复真实损失值
-            current_lr = optimizer.param_groups[-1]["lr"]  # 当前学习率
-
+            current_loss = loss.item() * args.accumulation_steps
+            current_lr = optimizer.param_groups[-1]["lr"]
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
 
             Logger(
@@ -78,27 +99,20 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 )
 
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
-            model.eval()  # 切换到评估模式
+            model.eval()
 
-            # 构建保存路径
             moe_suffix = (
                 "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
             )
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
 
-            # 📚 分布式模型保存知识点
-            # DDP模型需要通过.module访问真正的模型
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
             else:
                 state_dict = model.state_dict()
-
-            # 📚 半精度保存知识点
-            # 将float32参数转为float16，减少存储空间
             state_dict = {k: v.half() for k, v in state_dict.items()}
             torch.save(state_dict, ckp)
 
-            # 保存完整训练状态
             lm_checkpoint(
                 lm_config,
                 weight=args.save_weight,
@@ -108,11 +122,10 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 epoch=epoch,
                 step=step,
                 wandb=wandb,
-                save_dir="../checkpoints",  # ！修正：原"checkpoints"缺少../前缀
+                save_dir="../checkpoints",
             )
 
-            model.train()  # 恢复训练模式
-                
+            model.train()
 
 
 if __name__ == "__main__":
@@ -193,97 +206,52 @@ if __name__ == "__main__":
     # 解析命令行参数
     args = parser.parse_args()
 
-    # ========== 1. 初始化环境和随机种子 ==========
-    """
-    📚 分布式训练初始化知识点：
-    - local_rank: 当前进程在本机上的GPU编号
-    - 随机种子: 确保不同进程有不同但可复现的随机序列
-    - 这样既保证了随机性，又保证了可复现性
-    """
+    # ---------- 1. 分布式与随机种子 ----------
     local_rank = init_distributed_mode()
     if dist.is_initialized():
-        args.device = f"cuda:{local_rank}"  # 分布式训练时使用对应的GPU
+        args.device = f"cuda:{local_rank}"
 
-    # 📚 随机种子设置知识点
-    # 不同进程使用不同的种子，避免数据采样完全相同
-    # 42是基础种子，每个进程加上自己的rank保证不同
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
 
-    # ========== 2. 配置目录、模型参数、检查点 ==========
-    """
-    📚 模型配置和检查点管理：
-    - 创建保存目录
-    - 构建模型配置对象
-    - 尝试加载断点续训数据
-    """
-    os.makedirs(args.save_dir, exist_ok=True)  # 确保保存目录存在
+    # ---------- 2. 目录、配置、断点 ----------
+    # lm_config 的 hidden_size / num_hidden_layers / use_moe 需与数据集、后续 SFT 及 eval 使用的模型一致
+    os.makedirs(args.save_dir, exist_ok=True)
 
-    # 创建MiniMind模型配置
     lm_config = MokioMindConfig(
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_hidden_layers,
         use_moe=bool(args.use_moe),
     )
 
-    # 📚 断点续训知识点
-    # 如果开启了断点续训，尝试加载之前的训练状态
     ckp_data = (
         lm_checkpoint(
             lm_config, weight=args.save_weight, save_dir="../checkpoints"
-        )  # ！修正：原"checkpoints"缺少../前缀
+        )
         if args.from_resume == 1
         else None
     )
 
-    # ========== 3. 设置混合精度 ==========
-    """
-    📚 混合精度训练知识点：
-    - bfloat16: Google开发，数值范围大，更稳定
-    - float16: 标准半精度，节省内存但可能溢出
-    - autocast: 自动选择精度，关键运算用float32
-    """
+    # ---------- 3. 混合精度 ----------
     device_type = "cuda" if "cuda" in args.device else "cpu"
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
-
-    # 📚 上下文管理器知识点
-    # CPU不支持autocast，使用nullcontext作为空操作
     autocast_ctx = (
         nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     )
 
-    # ========== 4. 配置WandB实验跟踪 ==========
-    """
-    📚 实验跟踪系统知识点：
-    - WandB: 实验管理平台，记录训练过程
-    - SwanLab: 国产替代方案
-    - 支持断点续训时恢复到同一个实验
-    """
+    # ---------- 4. 实验跟踪（SwanLab 作 wandb 接口） ----------
     wandb = None
     if args.use_wandb and is_main_process():
         # 使用SwanLab作为WandB的替代
         import swanlab as wandb
 
-        # 📚 实验恢复知识点
-        # 如果有检查点数据，获取之前的wandb_id来恢复实验
         wandb_id = ckp_data.get("wandb_id") if ckp_data else None
-        resume = "must" if wandb_id else None  # 必须恢复到指定实验
-
-        # 构建实验名称，包含关键超参数
+        resume = "must" if wandb_id else None
         wandb_run_name = f"MokioMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(
             project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume
         )
 
-    # ========== 5. 定义模型、数据、优化器 ==========
-    """
-    📚 训练组件初始化：
-    - 模型: 根据配置创建MiniMind模型
-    - 数据集: 加载预训练数据
-    - 采样器: 分布式训练的数据分配
-    - 优化器: AdamW优化器
-    - 缩放器: 混合精度训练的梯度缩放
-    """
-    # 初始化模型和分词器
+    # ---------- 5. 模型、数据、优化器、断点恢复 ----------
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
 
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
@@ -296,31 +264,21 @@ if __name__ == "__main__":
 
     start_epoch, start_step = 0, 0
     if ckp_data:
-        # 恢复模型参数
         model.load_state_dict(ckp_data["model"])
-        # 恢复优化器状态（动量、方差估计等）
         optimizer.load_state_dict(ckp_data["optimizer"])
-        # 恢复梯度缩放器状态
         scaler.load_state_dict(ckp_data["scaler"])
-        # 恢复训练进度
         start_epoch = ckp_data["epoch"]
         start_step = ckp_data.get("step", 0)
 
     if dist.is_initialized():
-        # 📚 RoPE位置编码特殊处理
-        # freqs_cos, freqs_sin是位置编码缓存，不需要梯度同步
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         model = DistributedDataParallel(model, device_ids=[local_rank])
 
     for epoch in range(start_epoch, args.epochs):
-        # 📚 分布式采样器epoch设置
-        # 每个epoch设置不同的随机种子，确保数据顺序随机化
         if train_sampler:
             train_sampler.set_epoch(epoch)
 
-        # 📚 断点续训逻辑
-        if epoch == start_epoch and start_step > 0:  # 第一个epoch且存在检查点
-            # 使用跳批采样器，跳过已训练的数据
+        if epoch == start_epoch and start_step > 0:
             batch_sampler = SkipBatchSampler(
                 train_sampler or range(len(train_ds)), args.batch_size, start_step
             )
@@ -334,7 +292,7 @@ if __name__ == "__main__":
                 f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
             )
             train_epoch(epoch, loader, len(loader) + start_step, start_step, wandb)
-        else:  # 默认从头开始
+        else:
             loader = DataLoader(
                 train_ds,
                 batch_size=args.batch_size,

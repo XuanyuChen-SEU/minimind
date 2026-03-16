@@ -1,7 +1,37 @@
+"""
+MokioMind 主干模型 (model.py)
+
+在项目中的角色：
+  - 被 eval.py 与 trainer 共同使用：eval 中通过 MokioMindConfig + MokioMindForCausalLM 加载 .pth；
+    trainer 中通过 trainer_utils.init_model() 构造同一类模型用于训练。
+  - 与 dataset/lm_dataset 的 tokenizer、vocab_size 等约定一致；与 MokioMind 文件夹中的 demo 无依赖关系。
+  - 权重文件通常保存在 out/ 或 save_dir，命名如 pretrain_512.pth、full_sft_512_moe.pth。
+
+结构概览：
+  - MokioMindConfig: 配置类（hidden_size、层数、GQA、RoPE、MoE 等）
+  - RMSNorm: 预/后 LayerNorm 的替代，无 bias，最后一维归一化
+  - precompute_freqs / apply_rotary_pos_emb: RoPE 位置编码（支持 YaRN 外推）
+  - repeat_kv: GQA 下将 KV 头复用到 Q 头数量
+  - Attention: 多头自注意力（RoPE、KV cache、Flash Attention 可选）
+  - FeedForward: SwiGLU 前馈（gate * up -> down）
+  - MoEGate / MoEFeedForward: MoE 门控与多专家前馈
+  - MokioMindBlock: 单层 = pre-norm Attention + 残差 + pre-norm FFN/MoE + 残差
+  - MokioMindModel: Embedding + N × Block + 最终 RMSNorm
+  - MokioMindForCausalLM: Model + lm_head（与 embed 权重共享），兼容 GenerationMixin
+"""
 from transformers import PretrainedConfig
 
 
 class MokioMindConfig(PretrainedConfig):
+    """
+    MokioMind 模型配置。继承 HuggingFace PretrainedConfig，便于保存/加载。
+
+    重要参数：
+      - num_attention_heads / num_key_value_heads: GQA，KV 头数可小于 Q 头数（n_rep = heads // kv_heads）
+      - rope_theta / inference_rope_scaling: RoPE 基与是否启用 YaRN 外推（如 4x）
+      - use_moe: 是否用 MoE 前馈（n_routed_experts + n_shared_experts）
+      - flash_attention: 是否优先使用 scaled_dot_product_attention（因果 mask）
+    """
     model_type = "mokiomind"
 
     def __init__(
@@ -84,6 +114,11 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 class RMSNorm(nn.Module):
+    """
+    RMS 归一化（无 bias）：y = weight * x / sqrt(mean(x^2) + eps)。
+    输入/输出形状一致：x [..., dim] -> [..., dim]，在最后一维上做 RMS。
+    """
+
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
@@ -102,6 +137,12 @@ def precompute_freqs(
     rope_base: float = 1e6,
     rope_scaling: Optional[dict] = None,
 ):
+    """
+    预计算 RoPE 的 cos/sin 表，供 apply_rotary_pos_emb 使用。
+    dim: 单头维度（head_dim），即每侧旋转的维度数（freqs 长度为 dim//2）。
+    end: 最大位置数，决定位置维度长度。
+    返回: freqs_cos, freqs_sin，形状均为 [end, dim]，与位置索引、头维度对齐。
+    """
     # 1. 初始化标准 RoPE 频率。
     # torch.arange(0, dim, 2) 生成 [0, 2, 4, ... dim-2]
     # 计算出的 freqs 就是标准的 1 / (base ** (2i / d))
@@ -170,6 +211,11 @@ def precompute_freqs(
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """
+    对 Q、K 应用旋转位置编码（RoPE）。cos/sin 形状 [seq, head_dim]，会在 unsqueeze_dim 上扩维以广播。
+    公式：q_embed = q*cos + rotate_half(q)*sin（对 k 同理）。rotate_half 为后半维取反后与前半维拼接。
+    输入 q/k: [bsz, seq, n_heads, head_dim]；输出形状与 q/k 相同。
+    """
     def rotate_half(x):
         return torch.cat(
             (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
@@ -185,6 +231,11 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    GQA：将 KV 头沿头维度重复 n_rep 次，使 KV 头数与 Q 头数一致，便于做 attention。
+    输入 x: [bsz, slen, num_kv_heads, head_dim]；
+    输出: [bsz, slen, num_kv_heads * n_rep, head_dim]。
+    """
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1:
         return x
@@ -197,6 +248,13 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 
 class Attention(nn.Module):
+    """
+    多头自注意力（支持 GQA、RoPE、KV cache、Flash Attention）。
+    前向：x [bsz, seq_len, hidden] -> Q/K/V 投影 -> RoPE -> (可选) 拼 past_kv -> repeat_kv(K,V)
+    -> attention(scores 因果 mask + 可选 padding mask) -> 输出投影。
+    返回 output [bsz, seq_len, hidden], past_kv = (K, V) 或 None；K/V 形状 [bsz, n_kv_heads, total_len, head_dim]。
+    """
+
     def __init__(self, args: MokioMindConfig):
         super().__init__()
 
@@ -243,26 +301,29 @@ class Attention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
     ):
         bsz, seq_len, _ = x.shape
+        # 线性投影后拆头：xq [bsz, seq, n_heads, head_dim], xk/xv [bsz, seq, n_kv_heads, head_dim]
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
-        cos, sin = position_embeddings
+        cos, sin = position_embeddings  # 与当前步位置对应的 [cur_len, head_dim]
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
-        # kv_cache实现
+        # KV cache：将历史 K/V 与当前步 K/V 在 seq 维拼接，供下次自回归时复用
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
 
+        # 转为 [bsz, n_heads, seq, head_dim]，KV 经 repeat_kv 后头数与 Q 一致
         xq, xk, xv = (
             xq.transpose(1, 2),
             repeat_kv(xk, self.n_rep).transpose(1, 2),
             repeat_kv(xv, self.n_rep).transpose(1, 2),
         )
 
+        # Flash Attention 路径：无 padding、无 past 时用因果 SDPA；否则手写 scores + 因果 mask + padding mask
         if (
             self.flash
             and (seq_len > 1)
@@ -277,6 +338,7 @@ class Attention(nn.Module):
                 is_causal=True,
             )
         else:
+            # scores [bsz, n_heads, q_len, kv_len]；仅对当前步的 q_len 子块加因果 mask（下三角 -inf）
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
             scores[:, :, :, -seq_len:] += torch.triu(
                 torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
@@ -284,6 +346,7 @@ class Attention(nn.Module):
             )
 
             if attention_mask is not None:
+                # padding 位置置为 -1e9，softmax 后近似为 0
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
@@ -298,6 +361,12 @@ class Attention(nn.Module):
 
 
 class FeedForward(nn.Module):
+    """
+    SwiGLU 前馈：out = down( act(gate(x)) * up(x) )。
+    形状：x [..., hidden] -> gate/up -> [..., intermediate] -> 逐元乘 -> down -> [..., hidden]。
+    intermediate_size 默认约为 hidden_size * 8/3，并向上取整到 64 的倍数。
+    """
+
     def __init__(self, config: MokioMindConfig):
         super().__init__()
         if config.intermediate_size is None:
@@ -322,6 +391,12 @@ class FeedForward(nn.Module):
 
 
 class MoEGate(nn.Module):
+    """
+    MoE 门控：对每个 token 的 hidden 做线性变换得到 n_routed_experts 维 logits，
+    经 softmax 后取 top_k 专家及其权重；可选对 top_k 权重再归一化（norm_topk_prob）。
+    返回 topk_idx [bsz*seq, top_k], topk_weight [bsz*seq, top_k], aux_loss（负载均衡辅助损失）。
+    """
+
     def __init__(self, config: MokioMindConfig):
         super().__init__()
         self.config = config
@@ -344,8 +419,8 @@ class MoEGate(nn.Module):
 
     def forward(self, hidden_states):
         bsz, seq_len, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)
-        logits = F.linear(hidden_states, self.weight, None)
+        hidden_states = hidden_states.view(-1, h)  # [bsz*seq, hidden]
+        logits = F.linear(hidden_states, self.weight, None)  # [bsz*seq, n_routed_experts]
 
         if self.scoring_func == "softmax":
             scores = logits.softmax(dim=-1)
@@ -391,14 +466,21 @@ class MoEGate(nn.Module):
 
 
 class MoEFeedForward(nn.Module):  # ！修正：原MoEFeedForaward拼写错误
+    """
+    MoE 前馈：每个 token 由 gate 选出 top_k 个专家，经专家 FFN 后按权重加权求和；
+    若有 n_shared_experts，再加一次 shared 专家（对所有 token 相同）。
+    训练：按 token 遍历专家做前向再加权；推理：moe_infer 按专家打包，减少 kernel 调用。
+    会设置 self.aux_loss 供上层汇总（负载均衡损失）。
+    """
+
     def __init__(self, config: MokioMindConfig):
         super().__init__()
         self.config = config
-        # 专家层
+        # 专家层：n_routed_experts 个独立 FeedForward
         self.experts = nn.ModuleList(
             [FeedForward(config) for _ in range(config.n_routed_experts)]
         )
-        # 门控层
+        # 门控层：输出 top_k 专家索引与权重
         self.gate = MoEGate(config)
         if config.n_shared_experts > 0:
             self.shared_experts = nn.ModuleList(
@@ -410,23 +492,16 @@ class MoEFeedForward(nn.Module):  # ！修正：原MoEFeedForaward拼写错误
         orig_shape = x.shape
         bsz, seq_len, h = orig_shape
 
-        # 使用门控机制选择专家
+        # 门控：得到每个 token 的 top_k 专家索引与权重
         topk_idx, topk_weight, aux_loss = self.gate(x)
-        # 展开x以便处理
-        x = x.view(-1, x.shape[-1])
+        x = x.view(-1, x.shape[-1])  # [bsz*seq, hidden]
 
-        flat_topk_idx = topk_idx.view(-1)
+        flat_topk_idx = topk_idx.view(-1)  # [bsz*seq*top_k]，每个元素为专家 id
         if self.training:
-            # 按照定义的num_experts_per_tok重复输入token
-            # 每个token安排num_experts_per_tok个专家处理
+            # 训练：按 token 复制 top_k 份，每个 token 对应 top_k 个专家输入
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
-            # y是空张量，和x形状相同
             y = torch.empty_like(x, dtype=x.dtype)
-            # 遍历所有专家
             for i, expert in enumerate(self.experts):
-                # 找到所有指向专家i的token
-                # 然后将这些token输入专家i进行处理
-                # 最后将结果放回y对应位置
                 expert_out = expert(x[flat_topk_idx == i])
                 if expert_out.shape[0] > 0:
                     y[flat_topk_idx == i] = expert_out.to(y.dtype)
@@ -434,11 +509,9 @@ class MoEFeedForward(nn.Module):  # ！修正：原MoEFeedForaward拼写错误
                     y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(
                         p.sum() for p in expert.parameters()
                     )
-            # 加权求和
-            # 最后的y意义是每个token经过专家处理后的加权结果
+            # 按 topk_weight 对同一 token 的 top_k 个专家输出加权求和，再恢复 [bsz, seq, hidden]
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
             y = y.view(*orig_shape)
-        # 如果是推理阶段
         else:
             y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(
                 *orig_shape
@@ -450,35 +523,25 @@ class MoEFeedForward(nn.Module):  # ！修正：原MoEFeedForaward拼写错误
         return y
 
     @torch.no_grad()
-    # MoE推理方法
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
-        # 使用cache，创建一个和x形状相同的零张量
+        """
+        MoE 推理：按专家打包，每个专家一次性处理分到它的所有 token，再按原始 token 顺序 scatter 回结果。
+        x: [bsz*seq, hidden]；flat_expert_indices / flat_expert_weights: [bsz*seq*top_k]。
+        流程：argsort 将 token 按专家 id 排序 -> 按专家切段 -> 每段批量过对应 expert -> 加权 -> scatter_add 回 expert_cache。
+        """
         expert_cache = torch.zeros_like(x)
-        # 对专家索引进行排序，最后是[0,0,0,1,1,2,2,2,...]这样的顺序
-        # 分拣
-        idxs = flat_expert_indices.argsort()
-        # 统计每个专家被分配到的token数量
-        # 打包
+        idxs = flat_expert_indices.argsort()  # 排序后同一专家的 token 连续
         tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
-        # 计算每个token对应的专家索引
-        token_idxs = idxs // self.config.num_experts_per_tok
-        # 对每个打包好的包进行处理
+        token_idxs = idxs // self.config.num_experts_per_tok  # 排序后位置对应的原始 token 下标
         for i, end_idx in enumerate(tokens_per_expert):
-            # 计算当前包的起始位置
             start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
             if start_idx == end_idx:
                 continue
-            # 取出当前包对应的专家
             expert = self.experts[i]
-            # 取出token对应的原始id
             exp_token_idx = token_idxs[start_idx:end_idx]
-            # 取出token对应的数据
             expert_tokens = x[exp_token_idx]
-            # 计算专家输出，一次性处理当前包的所有token
             expert_out = expert(expert_tokens).to(expert_cache.dtype)
-            # 加权
             expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
-            # 将结果散点加到缓存中对应位置
             expert_cache.scatter_add_(
                 0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
             )
@@ -487,6 +550,11 @@ class MoEFeedForward(nn.Module):  # ！修正：原MoEFeedForaward拼写错误
 
 
 class MokioMindBlock(nn.Module):
+    """
+    单层 Transformer 块：pre-norm Attention + 残差 + pre-norm FFN/MoE + 残差。
+    输入/输出 hidden_states 形状均为 [bsz, seq_len, hidden_size]；另返回 present_key_value 供 KV cache。
+    """
+
     def __init__(self, layer_id: int, config: MokioMindConfig):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
@@ -532,6 +600,12 @@ class MokioMindBlock(nn.Module):
 
 
 class MokioMindModel(nn.Module):
+    """
+    主干：Embedding -> N × MokioMindBlock -> 最终 RMSNorm。
+    前向：input_ids [bsz, seq_len] -> hidden [bsz, seq_len, hidden] -> 每层用 start_pos:start_pos+seq_len 的 RoPE 切片。
+    返回 hidden_states [bsz, seq_len, hidden], presents (每层 KV), aux_loss（MoE 负载均衡和）。
+    """
+
     def __init__(self, config: MokioMindConfig):
         super().__init__()
         self.config = config
@@ -576,11 +650,12 @@ class MokioMindModel(nn.Module):
             past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         )
 
-        # Embedding + dropout
+        # Embedding + dropout：input_ids [bsz, seq_len] -> [bsz, seq_len, hidden]
         hidden_states = self.dropout(
             self.embed_tokens(input_ids)
-        )  # [bsz, seq_len, hidden]
+        )
 
+        # 当前步使用的 RoPE 片段，形状 [seq_length, head_dim]
         position_embeddings = (
             self.freqs_cos[start_pos : start_pos + seq_length],
             self.freqs_sin[start_pos : start_pos + seq_length],
@@ -615,13 +690,18 @@ class MokioMindModel(nn.Module):
 
 
 class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
+    """
+    因果语言模型：MokioMindModel + lm_head；embed_tokens 与 lm_head 权重共享（同一 Linear weight）。
+    前向：input_ids -> model -> hidden_states -> lm_head(hidden_states[:, slice, :]) -> logits [bsz, kept, vocab_size]。
+    logits_to_keep：生成时通常只保留最后一步，训练时可保留整段；labels 存在时计算 CE loss（shift 后、ignore_index=-100）。
+    """
     config_class = MokioMindConfig
 
     def __init__(self, config: MokioMindConfig):
         super().__init__(config)
         self.model = MokioMindModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.model.embed_tokens.weight = self.lm_head.weight
+        self.model.embed_tokens.weight = self.lm_head.weight  # 权重共享
 
     def forward(
         self,
@@ -641,6 +721,7 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
             **args,
         )
 
+        # 只对最后 logits_to_keep 个位置做 lm_head（生成时多为 1），减少计算
         slice_indices = (
             slice(-logits_to_keep, None)
             if isinstance(logits_to_keep, int)
@@ -650,6 +731,7 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
 
         loss = None
         if labels is not None:
+            # 自回归：预测下一个 token，shift_logits 与 shift_labels 对齐
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(
