@@ -62,19 +62,29 @@ def load_lora(model, path):
     从 path 加载 LoRA 权重到已 apply_lora 的 model。
     会去掉 state_dict key 的 "module." 前缀（DDP 保存的格式），再按 "name.lora." 匹配到各 module.lora。
     """
+    # 步骤1：获取模型所在设备（保证权重加载到相同设备）
     device = next(model.parameters()).device
+    # 步骤2：加载权重文件，映射到模型设备（避免设备不匹配）
     state_dict = torch.load(path, map_location=device)
+    
+    # 步骤3：去掉 DDP 保存的 "module." 前缀
     state_dict = {
         (k[7:] if k.startswith("module.") else k): v for k, v in state_dict.items()
     }
 
+    # 步骤4：遍历模型所有模块，仅处理带 lora 子模块的模块
     for name, module in model.named_modules():
+        # 检查当前模块是否有 lora 子模块（已应用 LoRA）
         if hasattr(module, "lora"):
+            # 步骤5：筛选当前模块的 LoRA 权重（按模块名匹配）
             lora_state = {
+                # 去掉模块名前缀，只保留 LoRA 内部的参数名（如 "A"、"B"）
                 k.replace(f"{name}.lora.", ""): v
+                # 筛选出以 "当前模块名.lora." 开头的权重
                 for k, v in state_dict.items()
                 if f"{name}.lora." in k
             }
+            # 步骤6：将筛选后的权重加载到该模块的 lora 子模块
             module.lora.load_state_dict(lora_state)
 
 
@@ -83,13 +93,22 @@ def save_lora(model, path):
     将模型中所有 module.lora 的 state_dict 合并保存到 path。
     若 model 被 DDP 包装，会尝试取 _orig_mod；key 会带上 "name.lora."，与 load_lora 对应。
     """
+    # 步骤1：兼容DDP包装的模型，获取原始模型
     raw_model = getattr(model, "_orig_mod", model)
+    # 步骤2：初始化空字典，用于合并所有LoRA权重
     state_dict = {}
+    # 步骤3：遍历原始模型的所有模块（按模块名+模块对象）
     for name, module in raw_model.named_modules():
+        # 步骤4：仅处理包含lora子模块的模块
         if hasattr(module, "lora"):
+            # 步骤5：清理模块名（去掉可能的module.前缀）
             clean_name = name[7:] if name.startswith("module.") else name
+            # 步骤6：生成当前模块的LoRA权重key（与load_lora匹配）
             lora_state = {
+                # 格式：{clean_name}.lora.{参数名}（如 model.layers.0.attention.lora.A）
                 f"{clean_name}.lora.{k}": v for k, v in module.lora.state_dict().items()
             }
+            # 步骤7：将当前模块的LoRA权重合并到总字典中
             state_dict.update(lora_state)
+    # 步骤8：保存合并后的LoRA权重到指定路径
     torch.save(state_dict, path)
