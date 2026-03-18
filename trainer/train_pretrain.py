@@ -314,3 +314,5 @@ if __name__ == "__main__":
                 pin_memory=True,
             )
             train_epoch(epoch, loader, len(loader), 0, wandb)
+    if dist.is_initialized():
+        dist.destroy_process_group()
