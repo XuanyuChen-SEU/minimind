@@ -19,6 +19,7 @@ MokioMind 主干模型 (model.py)
   - MokioMindModel: Embedding + N × Block + 最终 RMSNorm
   - MokioMindForCausalLM: Model + lm_head（与 embed 权重共享），兼容 GenerationMixin
 """
+from typing import Optional
 from transformers import PretrainedConfig
 
 
@@ -41,7 +42,7 @@ class MokioMindConfig(PretrainedConfig):
         eos_token_id: int = 2,
         hidden_act: str = "silu",
         hidden_size: int = 512,
-        intermediate_size: int = None,
+        intermediate_size: Optional[int] = None,
         max_position_embeddings: int = 32768,
         num_attention_heads: int = 8,
         num_hidden_layers: int = 8,
@@ -60,8 +61,8 @@ class MokioMindConfig(PretrainedConfig):
         aux_loss_alpha: float = 0.01,
         seq_aux: bool = True,
         norm_topk_prob: bool = True,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
 
         self.dropout = dropout
@@ -106,7 +107,7 @@ import torch
 import math
 import torch.nn as nn
 from torch.nn import init
-from typing import Optional, Tuple, List, Union
+from typing import Optional, Tuple, List, Union, Any, Dict
 import torch.nn.functional as F
 from transformers.activations import ACT2FN
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
@@ -124,11 +125,11 @@ class RMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))  # [dim]
 
-    def _norm(self, x):
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
         # x: [..., dim] -> mean(-1, keepdim=True) 得 [..., 1]，广播后 x 形状不变
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 输入 x: [..., dim]；输出: [..., dim]，形状不变
         return self.weight * self._norm(x.float()).type_as(x)
 
@@ -137,8 +138,8 @@ def precompute_freqs(
     dim: int,
     end: int = int(32 * 1024),
     rope_base: float = 1e6,
-    rope_scaling: Optional[dict] = None,
-):
+    rope_scaling: Optional[Dict[str, Any]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     预计算 RoPE 的 cos/sin 表，供 apply_rotary_pos_emb 使用。
     dim: 单头维度（head_dim），即每侧旋转的维度数（freqs 长度为 dim//2）。
@@ -211,7 +212,14 @@ def precompute_freqs(
     return freqs_cos, freqs_sin  # 均为 [end, dim]，dim = head_dim
 
 
-def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: Optional[torch.Tensor] = None,
+    unsqueeze_dim: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     对 Q、K 应用旋转位置编码（RoPE）。cos/sin 形状 [seq, head_dim]，会在 unsqueeze_dim 上扩维以广播。
     公式：q_embed = q*cos + rotate_half(q)*sin（对 k 同理）。rotate_half 为后半维取反后与前半维拼接。
@@ -304,9 +312,9 @@ class Attention(nn.Module):
         x: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        use_cache=False,
+        use_cache: bool = False,
         attention_mask: Optional[torch.Tensor] = None,
-    ):
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # 输入 x: [bsz, seq_len, hidden_size]
         bsz, seq_len, _ = x.shape
 
@@ -405,7 +413,7 @@ class FeedForward(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.act_fn = ACT2FN[config.hidden_act]
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 输入 x: [bsz, seq_len, hidden_size]（或任意 [..., hidden_size]）
         # gate_proj(x): [..., intermediate_size], up_proj(x): [..., intermediate_size]
         gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)  # [..., intermediate_size]
@@ -439,7 +447,9 @@ class MoEGate(nn.Module):
     def reset_parameters(self) -> None:
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
-    def forward(self, hidden_states):
+    def forward(
+        self, hidden_states: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # 输入 hidden_states: [bsz, seq_len, hidden_size]
         bsz, seq_len, h = hidden_states.shape
         hidden_states = hidden_states.view(-1, h)  # [bsz*seq_len, hidden_size]
@@ -520,7 +530,7 @@ class MoEFeedForward(nn.Module):  # ！修正：原MoEFeedForaward拼写错误
                 [FeedForward(config) for _ in range(config.n_shared_experts)]
             )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         # 输入 x: [bsz, seq_len, hidden_size]
         identity = x
         orig_shape = x.shape
@@ -557,7 +567,12 @@ class MoEFeedForward(nn.Module):  # ！修正：原MoEFeedForaward拼写错误
         return y  # [bsz, seq_len, hidden_size]
 
     @torch.no_grad()
-    def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+    def moe_infer(
+        self,
+        x: torch.Tensor,
+        flat_expert_indices: torch.Tensor,
+        flat_expert_weights: torch.Tensor,
+    ) -> torch.Tensor:
         """
         MoE 推理：按专家打包，每个专家一次性处理分到它的所有 token，再按原始 token 顺序 scatter 回结果。
         输入：
@@ -613,12 +628,12 @@ class MokioMindBlock(nn.Module):
 
     def forward(
         self,
-        hidden_states,
+        hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        use_cache=False,
+        use_cache: bool = False,
         attention_mask: Optional[torch.Tensor] = None,
-    ):
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         # 输入 hidden_states: [bsz, seq_len, hidden_size]；position_embeddings: (cos, sin) 各 [cur_len, head_dim]
         # past_key_value: 单层 KV cache，(K, V) 或 None；K/V 形状 [bsz, past_len, n_kv_heads, head_dim]
         res = hidden_states
@@ -675,10 +690,10 @@ class MokioMindModel(nn.Module):
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        past_key_values: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         use_cache: bool = False,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, List[Optional[Tuple[torch.Tensor, torch.Tensor]]], torch.Tensor]:
         # 输入 input_ids: [bsz, seq_len]，attention_mask: [bsz, seq_len] 或 [bsz, total_len]（1=有效，0=pad）
         # past_key_values: 长度为 num_hidden_layers 的列表，第 l 项为 (K_l, V_l) 或 None；
         #   每层 K/V 形状为 [bsz, past_len, n_kv_heads, head_dim]，past_len 为已缓存的序列长度（首次为 0）
@@ -754,11 +769,11 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        past_key_values: Optional[List[Optional[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         use_cache: bool = False,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        **args,
-    ):
+        **args: Any,
+    ) -> CausalLMOutputWithPast:
         # past_key_values 入参/出参形状：List of length num_hidden_layers，每层 (K, V)，K/V 为 [bsz, past_len或total_len, n_kv_heads, head_dim]
         # model 返回 hidden_states [bsz, seq_len, hidden_size], past_key_values（同上形状）, aux_loss
         hidden_states, past_key_values, aux_loss = self.model(
