@@ -17,6 +17,8 @@ train_full_sft.py —— MokioMind 全量监督微调（SFT）脚本
 
 训练逻辑：SFTDataset 返回 (input_ids, labels, attention_mask)，labels 为稀疏（仅 assistant 部分非 -100）；loss = res.loss + res.aux_loss；梯度累积、clip、scaler.step、按间隔保存与打日志（含 logits_loss / aux_loss）。
 """
+from __future__ import annotations
+
 import os
 import sys
 
@@ -32,6 +34,7 @@ from contextlib import nullcontext
 from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
+from typing import Any, Optional, Iterable, Tuple
 
 from model.model import MokioMindConfig
 from dataset.lm_dataset import SFTDataset
@@ -49,7 +52,13 @@ from trainer.trainer_utils import (
 warnings.filterwarnings("ignore")
 
 
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+def train_epoch(
+    epoch: int,
+    loader: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    iters: int,
+    start_step: int = 0,
+    wandb: Optional[Any] = None,
+) -> None:
     """
     执行一个 epoch 的 SFT。loader 每步产出 (input_ids, labels, attention_mask)，形状 [batch_size, max_seq_len]；
     labels 中仅 assistant 回复位置有效，其余为 -100。loss = 主 loss + MoE aux_loss，学习率余弦退火，梯度累积后 clip、scaler.step。

@@ -14,6 +14,8 @@ trainer_utils.py —— 训练通用工具
   - 模型加载：init_model（tokenizer + MokioMindForCausalLM，可选 from_weight 权重）
   - 采样器：SkipBatchSampler（包装任意 sampler，跳过前 skip_batches 个 batch，用于断点续训）
 """
+from __future__ import annotations
+
 import os
 import random
 import math
@@ -21,20 +23,24 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import Sampler
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from pathlib import Path
+from torch import nn, optim
+from transformers import PreTrainedTokenizerBase, PretrainedConfig
 
 
-def is_main_process():
+def is_main_process() -> bool:
     """当前进程是否为主进程（rank 0 或未启用分布式）。仅主进程应写日志、保存 checkpoint。"""
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
-def Logger(content):
+def Logger(content: object) -> None:
     """仅在主进程打印 content，避免多卡重复日志。"""
     if is_main_process():
         print(content)
 
 
-def get_lr(current_step, total_steps, lr):
+def get_lr(current_step: int, total_steps: int, lr: float) -> float:
     """
     余弦退火学习率：lr * (0.1 + 0.45 * (1 + cos(π * current_step / total_steps)))。
     step=0 时等于 lr，step=total_steps 时约为 0.1*lr；中间平滑下降。
@@ -44,7 +50,7 @@ def get_lr(current_step, total_steps, lr):
     )  # ！修正：原公式 step=0 时 lr=1.1*lr 超出设定值，现修正为 step=0→lr, step=end→0.1*lr
 
 
-def init_distributed_mode():
+def init_distributed_mode() -> int:
     """
     根据环境变量 RANK 判断是否启动 DDP。若 RANK 未设置则返回 0（单机单卡）；
     否则 init_process_group(NCCL)，设置当前进程的 CUDA 设备为 LOCAL_RANK，并返回 local_rank。
@@ -70,16 +76,16 @@ def setup_seed(seed: int):
 
 
 def lm_checkpoint(
-    lm_config,
-    weight="full_sft",
-    model=None,
-    optimizer=None,
-    epoch=0,
-    step=0,
-    wandb=None,
-    save_dir="checkpoints",
+    lm_config: PretrainedConfig,
+    weight: str = "full_sft",
+    model: Optional[nn.Module] = None,
+    optimizer: Optional[optim.Optimizer] = None,
+    epoch: int = 0,
+    step: int = 0,
+    wandb: Optional[Any] = None,
+    save_dir: Union[str, Path] = "checkpoints",
     **kwargs,
-):
+) -> Optional[Dict[str, Any]]:
     """
     保存或加载训练检查点。
     - 保存模式（model 不为 None）：将模型 state_dict（fp16）、optimizer、epoch、step、world_size、wandb_id 及 kwargs 中带 state_dict 的对象保存到 *_resume.pth；仅模型权重另存到 *.pth（覆盖写入用 .tmp 原子替换）。
@@ -113,9 +119,9 @@ def lm_checkpoint(
             else:
                 wandb_id = getattr(wandb, "id", None)
 
-        resume_data = {
+        resume_data: Dict[str, Any] = {
             "model": state_dict,
-            "optimizer": optimizer.state_dict(),
+            "optimizer": optimizer.state_dict() if optimizer is not None else None,
             "epoch": epoch,
             "step": step,
             "world_size": dist.get_world_size() if dist.is_initialized() else 1,
@@ -153,11 +159,11 @@ def lm_checkpoint(
 
 
 def init_model(
-    lm_config,
-    from_weight="pretrain",
-    tokenizer_path=None,
-    save_dir="../out",
-    device="cuda",
+    lm_config: PretrainedConfig,
+    from_weight: str = "pretrain",
+    tokenizer_path: Optional[Union[str, Path]] = None,
+    save_dir: Union[str, Path] = "../out",
+    device: Union[str, torch.device] = "cuda",
 ):
     """
     构建 MokioMindForCausalLM 与 tokenizer。tokenizer 从 tokenizer_path 或项目 model 目录加载；
@@ -195,19 +201,21 @@ def init_model(
     return model.to(device), tokenizer
 
 
-class SkipBatchSampler(Sampler):
+class SkipBatchSampler(Sampler[List[int]]):
     """
     包装任意 Sampler/迭代器，按 batch_size 组成 batch，但前 skip_batches 个 batch 不产出，
-    用于断点续训时跳过已训练过的 step。__len__ = max(0, 总 batch 数 - skip_batches)。
+    用于断点续训时跳过已训练过的 step。__len__ = max(0, 总 batch 数 - skip_batches)，即总 batch 数 - skip_batches。
     """
 
-    def __init__(self, sampler, batch_size, skip_batches=0):
+    def __init__(
+        self, sampler: Sampler[int], batch_size: int, skip_batches: int = 0
+    ) -> None:
         self.sampler = sampler
         self.batch_size = batch_size
         self.skip_batches = skip_batches
 
-    def __iter__(self):
-        batch = []
+    def __iter__(self) -> Iterator[List[int]]:
+        batch: List[int] = []
         skipped = 0
 
         for idx in self.sampler:
@@ -225,6 +233,6 @@ class SkipBatchSampler(Sampler):
         if len(batch) > 0 and skipped >= self.skip_batches:
             yield batch
 
-    def __len__(self):
+    def __len__(self) -> int:
         total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
         return max(0, total_batches - self.skip_batches)

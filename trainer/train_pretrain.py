@@ -17,11 +17,14 @@ train_pretrain.py —— MokioMind 自回归预训练脚本
 
 训练逻辑：PretrainDataset 返回 (input_ids, labels, attention_mask)；前向时传入 labels 做 CE loss（模型内部 shift），梯度累积后 clip_grad_norm、scaler.step、按间隔保存与打日志。
 """
+from __future__ import annotations
+
 import os
 import sys
 
 
 __package__ = "trainer"
+# 将项目目录导入到 sys.path，以便导入项目中的模块
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import argparse
@@ -33,6 +36,7 @@ from contextlib import nullcontext
 from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
+from typing import Any, Optional, Iterable, Tuple
 
 from model.model import MokioMindConfig
 from dataset.lm_dataset import PretrainDataset
@@ -50,7 +54,13 @@ from trainer.trainer_utils import (
 warnings.filterwarnings("ignore")
 
 
-def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
+def train_epoch(
+    epoch: int,
+    loader: Iterable[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    iters: int,
+    start_step: int = 0,
+    wandb: Optional[Any] = None,
+) -> None:
     """
     执行一个 epoch 的预训练。loader 每步产出 (input_ids, labels, attention_mask)，形状 [batch_size, max_seq_len]。
     学习率按 get_lr 余弦退火；loss 做梯度累积后 clip、scaler.step；按 log_interval 打日志、save_interval 保存 checkpoint。

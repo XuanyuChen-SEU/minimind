@@ -18,11 +18,16 @@ lm_dataset.py —— 语言模型训练用数据集封装
   - 除 RLAIFDataset 外，__getitem__ 返回的序列长度均为 max_length（右侧 PAD 补齐）。
   - attention_mask：1=有效 token，0=padding，用于 attention 层屏蔽，形状与对应 input_ids 一致。
 """
+from __future__ import annotations
+
 from torch.utils.data import Dataset
 import torch
 import os
 import random
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from pathlib import Path
 from datasets import load_dataset
+from transformers import PreTrainedTokenizerBase
 
 # 禁用 HuggingFace tokenizer 的多进程并行，避免在 DataLoader 多进程环境中产生死锁
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -32,7 +37,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def pre_processing_chat(conversations, add_system_ratio=0.2):
+def pre_processing_chat(
+    conversations: List[Dict[str, Any]], add_system_ratio: float = 0.2
+) -> List[Dict[str, Any]]:
     """
     对话前处理：以一定概率随机插入 system 消息。
 
@@ -62,7 +69,7 @@ def pre_processing_chat(conversations, add_system_ratio=0.2):
     return conversations
 
 
-def post_processing_chat(prompt_content, empty_think_ratio=0.05):
+def post_processing_chat(prompt_content: str, empty_think_ratio: float = 0.05) -> str:
     """
     对话后处理：清理模板渲染后多余的空 <think> 块。
 
@@ -102,17 +109,22 @@ class PretrainDataset(Dataset):
       - attention_mask: [max_length]，1=有效，0=padding
     """
 
-    def __init__(self, data_path, tokenizer, max_length=512):
+    def __init__(
+        self,
+        data_path: Union[str, Path],
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int = 512,
+    ) -> None:
         super().__init__()
         # tokenizer 需与 model 目录下 eval/train 使用的 tokenizer 一致（同一 vocab、BOS/EOS/PAD id）
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = load_dataset("json", data_files=data_path, split="train")
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         sample = self.samples[index]
 
         # Step 1：tokenize 原始文本，留出首尾各 1 个 token 的位置给 BOS/EOS
@@ -169,7 +181,12 @@ class SFTDataset(Dataset):
       - attention_mask: [max_length]，1=非 PAD，0=PAD
     """
 
-    def __init__(self, jsonl_path, tokenizer, max_length=1024):
+    def __init__(
+        self,
+        jsonl_path: Union[str, Path],
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int = 1024,
+    ) -> None:
         super().__init__()
         # tokenizer 与 model 目录一致；max_length 与 train_full_sft 的 --max_seq_len 对应
         self.tokenizer = tokenizer
@@ -186,10 +203,10 @@ class SFTDataset(Dataset):
             f"{tokenizer.eos_token}\n", add_special_tokens=False
         ).input_ids
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.samples)
 
-    def create_chat_prompt(self, conversations):
+    def create_chat_prompt(self, conversations: List[Dict[str, Any]]) -> str:
         """
         将多轮对话转换为模型输入的字符串（未 tokenize）。
 
@@ -219,7 +236,7 @@ class SFTDataset(Dataset):
             messages, tokenize=False, add_generation_prompt=False, tools=tools
         )
 
-    def generate_labels(self, input_ids):
+    def generate_labels(self, input_ids: List[int]) -> List[int]:
         """
         生成 SFT 训练所需的稀疏标签序列。
 
@@ -255,7 +272,7 @@ class SFTDataset(Dataset):
                 i += 1
         return labels
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         sample = self.samples[index]
 
         # Step 1：随机决定是否插入 system prompt（数据增强）
@@ -319,7 +336,12 @@ class DPODataset(Dataset):
       - attention_mask_*:          [max_length-1]，1=非 PAD，0=PAD
     """
 
-    def __init__(self, file_path, tokenizer, max_length=4096):
+    def __init__(
+        self,
+        file_path: Union[str, Path],
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int = 4096,
+    ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -337,10 +359,10 @@ class DPODataset(Dataset):
         ).input_ids
         self.samples = load_dataset("json", data_files=file_path, split="train")
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.samples)
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
         sample = self.samples[index]
         chosen = sample["chosen"]  # 优质回答对话列表，格式：[{role, content}, ...]
         rejected = sample["rejected"]  # 劣质回答对话列表，格式同上
@@ -406,7 +428,7 @@ class DPODataset(Dataset):
             "attention_mask_rejected": attention_mask_rejected,
         }
 
-    def generate_loss_mask(self, input_ids):
+    def generate_loss_mask(self, input_ids: List[int]) -> List[int]:
         """
         生成 DPO 训练所需的 loss mask（0/1 二值序列）。
 
@@ -468,7 +490,12 @@ class RLAIFDataset(Dataset):
     与 Pretrain/SFT/DPO 的区别：不返回任何张量，由 RL trainer 在线 tokenize 并 rollout。
     """
 
-    def __init__(self, jsonl_path, tokenizer, max_length=1024):
+    def __init__(
+        self,
+        jsonl_path: Union[str, Path],
+        tokenizer: PreTrainedTokenizerBase,
+        max_length: int = 1024,
+    ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -481,10 +508,10 @@ class RLAIFDataset(Dataset):
             f"{tokenizer.eos_token}", add_special_tokens=False
         ).input_ids
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.samples)
 
-    def create_chat_prompt(self, conversations):
+    def create_chat_prompt(self, conversations: Sequence[Dict[str, str]]) -> Tuple[str, str]:
         """
         从对话列表中分离 prompt（上文）和 answer（参考答案）。
 
@@ -514,7 +541,7 @@ class RLAIFDataset(Dataset):
         prompt = post_processing_chat(prompt)
         return prompt, answer
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: int) -> Dict[str, str]:
         sample = self.samples[index]
         # 返回原始字符串，不做 tokenize，由 RL trainer 在线处理；无张量形状，仅 str
         prompt, answer = self.create_chat_prompt(sample["conversations"])

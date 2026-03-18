@@ -13,6 +13,8 @@ LoRA（Low-Rank Adaptation）适配模块 (model_lora.py)
 """
 import torch
 from torch import optim, nn
+from typing import Callable, Dict, Union
+from pathlib import Path
 
 
 class LoRA(nn.Module):
@@ -22,7 +24,7 @@ class LoRA(nn.Module):
     A 高斯初始化、B 零初始化，使训练初期的输出与未加 LoRA 时一致。
     """
 
-    def __init__(self, in_features, out_features, rank):
+    def __init__(self, in_features: int, out_features: int, rank: int) -> None:
         super().__init__()
         self.rank = rank
         self.A = nn.Linear(in_features, rank, bias=False)
@@ -30,11 +32,11 @@ class LoRA(nn.Module):
         self.A.weight.data.normal_(mean=0.0, std=0.02)
         self.B.weight.data.zero_()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.B(self.A(x))
 
 
-def apply_lora(model, rank=8):
+def apply_lora(model: nn.Module, rank: int = 8) -> None:
     """
     为模型中所有「方阵」Linear 层挂载 LoRA 子模块，并替换 forward 为 原层(x) + lora(x)。
     仅当 weight.shape[0] == weight.shape[1] 时挂载（避免误改 embedding 或 lm_head 等非方线性层）。
@@ -51,21 +53,25 @@ def apply_lora(model, rank=8):
             setattr(module, "lora", lora)
             original_forward = module.forward
 
-            def forward_with_lora(x, layer1=original_forward, layer2=lora):
+            def forward_with_lora(
+                x: torch.Tensor,
+                layer1: Callable[[torch.Tensor], torch.Tensor] = original_forward,
+                layer2: nn.Module = lora,
+            ) -> torch.Tensor:
                 return layer1(x) + layer2(x)
 
             module.forward = forward_with_lora
 
 
-def load_lora(model, path):
+def load_lora(model: nn.Module, path: Union[str, Path]) -> None:
     """
     从 path 加载 LoRA 权重到已 apply_lora 的 model。
     会去掉 state_dict key 的 "module." 前缀（DDP 保存的格式），再按 "name.lora." 匹配到各 module.lora。
     """
-    # 步骤1：获取模型所在设备（保证权重加载到相同设备）
+    # 步骤1：获取模型所在设备（保证权重加载到相同设备）next()：取第一个参数
     device = next(model.parameters()).device
     # 步骤2：加载权重文件，映射到模型设备（避免设备不匹配）
-    state_dict = torch.load(path, map_location=device)
+    state_dict: Dict[str, torch.Tensor] = torch.load(path, map_location=device)
     
     # 步骤3：去掉 DDP 保存的 "module." 前缀
     state_dict = {
@@ -88,7 +94,7 @@ def load_lora(model, path):
             module.lora.load_state_dict(lora_state)
 
 
-def save_lora(model, path):
+def save_lora(model: nn.Module, path: Union[str, Path]) -> None:
     """
     将模型中所有 module.lora 的 state_dict 合并保存到 path。
     若 model 被 DDP 包装，会尝试取 _orig_mod；key 会带上 "name.lora."，与 load_lora 对应。
@@ -96,7 +102,7 @@ def save_lora(model, path):
     # 步骤1：兼容DDP包装的模型，获取原始模型
     raw_model = getattr(model, "_orig_mod", model)
     # 步骤2：初始化空字典，用于合并所有LoRA权重
-    state_dict = {}
+    state_dict: Dict[str, torch.Tensor] = {}
     # 步骤3：遍历原始模型的所有模块（按模块名+模块对象）
     for name, module in raw_model.named_modules():
         # 步骤4：仅处理包含lora子模块的模块
