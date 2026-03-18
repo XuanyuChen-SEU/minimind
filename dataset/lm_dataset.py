@@ -140,7 +140,7 @@ class PretrainDataset(Dataset):
         labels = input_ids.clone()
         labels[input_ids == self.tokenizer.pad_token_id] = -100
 
-        # ！修正：返回 attention_mask，使 attention 层能屏蔽 padding token
+        # 返回 attention_mask，使 attention 层能屏蔽 padding token
         attention_mask = (input_ids != self.tokenizer.pad_token_id).long()
         return input_ids, labels, attention_mask
 
@@ -209,9 +209,9 @@ class SFTDataset(Dataset):
         tools = (
             conversations[0]["functions"]
             if (
-                conversations
-                and conversations[0]["role"] == "system"
-                and conversations[0].get("functions")
+                conversations  # 对话列表非空
+                and conversations[0]["role"] == "system"  # 第一条是系统角色
+                and conversations[0].get("functions")  # 系统角色包含functions字段
             )
             else None
         )
@@ -280,7 +280,7 @@ class SFTDataset(Dataset):
         #     print(f"{i:3d}: X={self.tokenizer.decode([x])!r:16s} ---> Y={self.tokenizer.decode([input_ids[i+1]])!r:16s} label={y}")
         # # ================
 
-        # ！修正：返回 attention_mask，使 attention 层能屏蔽 padding token；形状均为 [max_length]
+        # 返回 attention_mask，使 attention 层能屏蔽 padding token；形状均为 [max_length]
         attention_mask = (
             torch.tensor(input_ids, dtype=torch.long) != self.tokenizer.pad_token_id
         ).long()
