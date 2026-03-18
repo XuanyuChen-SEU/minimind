@@ -122,12 +122,14 @@ class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.weight = nn.Parameter(torch.ones(dim))  # [dim]
 
     def _norm(self, x):
+        # x: [..., dim] -> mean(-1, keepdim=True) 得 [..., 1]，广播后 x 形状不变
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        # 输入 x: [..., dim]；输出: [..., dim]，形状不变
         return self.weight * self._norm(x.float()).type_as(x)
 
 
@@ -143,9 +145,8 @@ def precompute_freqs(
     end: 最大位置数，决定位置维度长度。
     返回: freqs_cos, freqs_sin，形状均为 [end, dim]，与位置索引、头维度对齐。
     """
-    # 1. 初始化标准 RoPE 频率。
-    # torch.arange(0, dim, 2) 生成 [0, 2, 4, ... dim-2]
-    # 计算出的 freqs 就是标准的 1 / (base ** (2i / d))
+    # 1. 初始化标准 RoPE 频率。torch.arange(0, dim, 2)[:(dim//2)] 长度为 dim//2。
+    # freqs 形状 [dim//2]，对应 1 / (base ** (2i/d))，i = 0,1,...,dim//2-1
     freqs, attn_factor = (
         1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)),
         1.0,
@@ -198,29 +199,33 @@ def precompute_freqs(
             freqs = freqs * (1 - ramp + ramp / factor)
 
     # 7. 根据目标长度 end，生成位置索引向量 t
-    t = torch.arange(end, device=freqs.device)
+    t = torch.arange(end, device=freqs.device)  # [end]
 
     # 8. 计算外积：将位置 t 与处理好的频率 freqs 相乘，得到每个位置的旋转角度 θ
-    freqs = torch.outer(t, freqs).float()
+    freqs = torch.outer(t, freqs).float()  # [end, dim//2]
 
-    # 9. 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)
-    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
-    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+    # 9. 计算 Cos 和 Sin，并应用注意力补偿系数 (attn_factor)；沿 dim=-1 复制一份得到完整 head_dim
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor  # [end, dim]
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor  # [end, dim]
 
-    return freqs_cos, freqs_sin
+    return freqs_cos, freqs_sin  # 均为 [end, dim]，dim = head_dim
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     """
     对 Q、K 应用旋转位置编码（RoPE）。cos/sin 形状 [seq, head_dim]，会在 unsqueeze_dim 上扩维以广播。
     公式：q_embed = q*cos + rotate_half(q)*sin（对 k 同理）。rotate_half 为后半维取反后与前半维拼接。
-    输入 q/k: [bsz, seq, n_heads, head_dim]；输出形状与 q/k 相同。
+    输入 q: [bsz, seq, n_heads, head_dim], k: [bsz, seq, n_kv_heads, head_dim]；
+    cos/sin: [seq, head_dim]，unsqueeze(1) 后 [1, seq, 1, head_dim]，与 q/k 广播。
+    输出 q_embed/k_embed: 与 q/k 形状相同。
     """
     def rotate_half(x):
+        # x: [..., head_dim] -> 后半维取反与前半维拼接，仍 [..., head_dim]
         return torch.cat(
             (-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1
         )
 
+    # cos/sin unsqueeze 后与 q/k 广播，逐元素运算，输出形状同 q/k
     q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
         rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
     )
@@ -234,14 +239,15 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     GQA：将 KV 头沿头维度重复 n_rep 次，使 KV 头数与 Q 头数一致，便于做 attention。
     输入 x: [bsz, slen, num_kv_heads, head_dim]；
-    输出: [bsz, slen, num_kv_heads * n_rep, head_dim]。
+    中间 expand 后: [bsz, slen, num_kv_heads, n_rep, head_dim]；
+    输出: [bsz, slen, num_kv_heads * n_rep, head_dim]（与 Q 头数一致）。
     """
     bs, slen, num_key_value_heads, head_dim = x.shape
     if n_rep == 1:
         return x
 
     return (
-        x[:, :, :, None, :]
+        x[:, :, :, None, :]  # [bsz, slen, num_kv_heads, 1, head_dim]
         .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
         .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
     )
@@ -250,9 +256,10 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
 class Attention(nn.Module):
     """
     多头自注意力（支持 GQA、RoPE、KV cache、Flash Attention）。
-    前向：x [bsz, seq_len, hidden] -> Q/K/V 投影 -> RoPE -> (可选) 拼 past_kv -> repeat_kv(K,V)
+    前向：x [bsz, seq_len, hidden_size] -> Q/K/V 投影 -> RoPE -> (可选) 拼 past_kv -> repeat_kv(K,V)
     -> attention(scores 因果 mask + 可选 padding mask) -> 输出投影。
-    返回 output [bsz, seq_len, hidden], past_kv = (K, V) 或 None；K/V 形状 [bsz, n_kv_heads, total_len, head_dim]。
+    返回 output [bsz, seq_len, hidden_size], past_kv = (K, V) 或 None；
+    past 中 K/V 形状均为 [bsz, n_kv_heads, total_len, head_dim]，total_len = past_len + cur_seq_len。
     """
 
     def __init__(self, args: MokioMindConfig):
@@ -264,7 +271,7 @@ class Attention(nn.Module):
             else args.num_key_value_heads
         )
 
-        assert args.num_attention_heads % self.num_key_value_heads == 0
+        assert args.num_attention_heads % self.num_key_value_heads == 0, f"num_attention_heads {args.num_attention_heads} must be divisible by num_key_value_heads {self.num_key_value_heads}"
 
         self.n_local_heads = args.num_attention_heads
         self.n_local_kv_heads = self.num_key_value_heads
@@ -300,26 +307,35 @@ class Attention(nn.Module):
         use_cache=False,
         attention_mask: Optional[torch.Tensor] = None,
     ):
+        # 输入 x: [bsz, seq_len, hidden_size]
         bsz, seq_len, _ = x.shape
-        # 线性投影后拆头：xq [bsz, seq, n_heads, head_dim], xk/xv [bsz, seq, n_kv_heads, head_dim]
+
+        # 线性投影（最后一维变化，前两维不变）后按头 reshape：
+        # q_proj(x) -> [bsz, seq_len, n_heads*head_dim] -> view -> [bsz, seq_len, n_local_heads, head_dim]
+        # k_proj/v_proj(x) -> [bsz, seq_len, n_kv_heads*head_dim] -> view -> [bsz, seq_len, n_local_kv_heads, head_dim]
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
 
-        cos, sin = position_embeddings  # 与当前步位置对应的 [cur_len, head_dim]
+        # RoPE：cos/sin 形状 [cur_len, head_dim]，cur_len = seq_len（无 cache）或与 position 对应长度
+        cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+        # xq 仍 [bsz, seq_len, n_local_heads, head_dim]，xk/xv 仍 [bsz, seq_len, n_local_kv_heads, head_dim]
 
-        # KV cache：将历史 K/V 与当前步 K/V 在 seq 维拼接，供下次自回归时复用
+        # KV cache 输入：past_key_value = (K, V)，K/V 形状均为 [bsz, past_len, n_kv_heads, head_dim]；在 dim=1(序列维) 上拼当前步
+        # 拼接后 xk/xv: [bsz, past_len+seq_len, n_local_kv_heads, head_dim]；若 use_cache 则返回的 past_kv 中 K/V 即此形状
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
 
-        # 转为 [bsz, n_heads, seq, head_dim]，KV 经 repeat_kv 后头数与 Q 一致
+        # 转为 [bsz, n_heads, kv_len, head_dim] 以做 batch matmul；repeat_kv 使 KV 头数 = n_local_heads
+        # xq: [bsz, seq_len, n_heads, head_dim] -> transpose(1,2) -> [bsz, n_heads, seq_len, head_dim]
+        # xk/xv 经 repeat_kv 后 [bsz, kv_len, n_heads, head_dim] -> transpose -> [bsz, n_heads, kv_len, head_dim]，kv_len = past_len+seq_len
         xq, xk, xv = (
-            xq.transpose(1, 2),
-            repeat_kv(xk, self.n_rep).transpose(1, 2),
+            xq.transpose(1, 2),  # [bsz, n_local_heads, seq_len, head_dim]
+            repeat_kv(xk, self.n_rep).transpose(1, 2),  # [bsz, n_local_heads, kv_len, head_dim]
             repeat_kv(xv, self.n_rep).transpose(1, 2),
         )
 
@@ -330,6 +346,8 @@ class Attention(nn.Module):
             and (past_key_value is None)
             and (attention_mask is None or torch.all(attention_mask == 1))
         ):
+            # SDPA 输入/输出：q [bsz, n_heads, seq_len, head_dim], k/v [bsz, n_heads, seq_len, head_dim]
+            # 输出 output: [bsz, n_heads, seq_len, head_dim]
             output = F.scaled_dot_product_attention(
                 xq,
                 xk,
@@ -338,32 +356,34 @@ class Attention(nn.Module):
                 is_causal=True,
             )
         else:
-            # scores [bsz, n_heads, q_len, kv_len]；仅对当前步的 q_len 子块加因果 mask（下三角 -inf）
+            # xq @ xk^T: [bsz, n_heads, seq_len, head_dim] @ [bsz, n_heads, head_dim, kv_len] -> [bsz, n_heads, seq_len, kv_len]
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            # 仅对“当前步 q 对当前步 k”子块加因果 mask：[seq_len, seq_len] 上三角为 -inf
             scores[:, :, :, -seq_len:] += torch.triu(
                 torch.full((seq_len, seq_len), float("-inf"), device=scores.device),
                 diagonal=1,
             )
 
             if attention_mask is not None:
-                # padding 位置置为 -1e9，softmax 后近似为 0
+                # attention_mask: [bsz, kv_len]，1=有效 0=pad；扩维成 [bsz, 1, 1, kv_len] 与 scores 广播
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
                 scores = scores + extended_attention_mask
 
-            scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            scores = F.softmax(scores.float(), dim=-1).type_as(xq)  # [bsz, n_heads, seq_len, kv_len]
             scores = self.attn_dropout(scores)
-            output = scores @ xv
+            output = scores @ xv  # [bsz, n_heads, seq_len, kv_len] @ [bsz, n_heads, kv_len, head_dim] -> [bsz, n_heads, seq_len, head_dim]
 
+        # 合并头维度：transpose(1,2) -> [bsz, seq_len, n_heads, head_dim]，reshape -> [bsz, seq_len, n_heads*head_dim]
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
-        output = self.resid_dropout(self.o_proj(output))
+        output = self.resid_dropout(self.o_proj(output))  # [bsz, seq_len, hidden_size]
         return output, past_kv
 
 
 class FeedForward(nn.Module):
     """
     SwiGLU 前馈：out = down( act(gate(x)) * up(x) )。
-    形状：x [..., hidden] -> gate/up -> [..., intermediate] -> 逐元乘 -> down -> [..., hidden]。
+    形状：x [..., hidden_size] -> gate/up -> [..., intermediate_size] -> 逐元乘 -> down -> [..., hidden_size]。
     intermediate_size 默认约为 hidden_size * 8/3，并向上取整到 64 的倍数。
     """
 
@@ -386,15 +406,17 @@ class FeedForward(nn.Module):
         self.act_fn = ACT2FN[config.hidden_act]
 
     def forward(self, x):
-        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
-        return self.dropout(self.down_proj(gated))
+        # 输入 x: [bsz, seq_len, hidden_size]（或任意 [..., hidden_size]）
+        # gate_proj(x): [..., intermediate_size], up_proj(x): [..., intermediate_size]
+        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)  # [..., intermediate_size]
+        return self.dropout(self.down_proj(gated))  # [..., hidden_size]，与输入 x 前两维一致
 
 
 class MoEGate(nn.Module):
     """
     MoE 门控：对每个 token 的 hidden 做线性变换得到 n_routed_experts 维 logits，
     经 softmax 后取 top_k 专家及其权重；可选对 top_k 权重再归一化（norm_topk_prob）。
-    返回 topk_idx [bsz*seq, top_k], topk_weight [bsz*seq, top_k], aux_loss（负载均衡辅助损失）。
+    返回 topk_idx [bsz*seq, top_k], topk_weight [bsz*seq, top_k], aux_loss（标量，负载均衡辅助损失）。
     """
 
     def __init__(self, config: MokioMindConfig):
@@ -410,7 +432,7 @@ class MoEGate(nn.Module):
         self.norm_topk_prob = config.norm_topk_prob
         self.gating_dim = config.hidden_size
         self.weight = nn.Parameter(
-            torch.empty((self.n_routed_experts, self.gating_dim))
+            torch.empty((self.n_routed_experts, self.gating_dim))  # [n_routed_experts, hidden_size]
         )
         self.reset_parameters()
 
@@ -418,50 +440,61 @@ class MoEGate(nn.Module):
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, hidden_states):
+        # 输入 hidden_states: [bsz, seq_len, hidden_size]
         bsz, seq_len, h = hidden_states.shape
-        hidden_states = hidden_states.view(-1, h)  # [bsz*seq, hidden]
-        logits = F.linear(hidden_states, self.weight, None)  # [bsz*seq, n_routed_experts]
+        hidden_states = hidden_states.view(-1, h)  # [bsz*seq_len, hidden_size]
+        logits = F.linear(hidden_states, self.weight, None)  # [bsz*seq_len, n_routed_experts]
 
         if self.scoring_func == "softmax":
-            scores = logits.softmax(dim=-1)
+            scores = logits.softmax(dim=-1)  # [bsz*seq_len, n_routed_experts]
         else:
             raise NotImplementedError(
                 f"insupportable scoring function for MoE gating: {self.scoring_func}"
             )
 
+        # topk_weight: [bsz*seq_len, top_k], topk_idx: [bsz*seq_len, top_k]，每个元素为专家 id (0..n_routed_experts-1)
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
 
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
-            topk_weight = topk_weight / denominator
+            topk_weight = topk_weight / denominator  # 每个 token 的 top_k 权重和为 1
 
+        # ---------- 负载均衡辅助损失（仅训练时、alpha>0 时计算）----------
+        # 目的：鼓励各专家被均匀使用，避免部分专家过载、部分闲置。与主 loss 加权相加后反向传播。
         if self.training and self.alpha > 0.0:
-            scores_for_aux = scores
+            scores_for_aux = scores  # [bsz*seq_len, n_routed_experts]，门控 softmax 分数
             aux_topk = self.top_k
-            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+            topk_idx_for_aux_loss = topk_idx.view(bsz, -1)  # [bsz, seq_len*top_k]，每个位置选中的专家 id
+
+            # 序列级辅助损失（seq_aux=True）：按 batch 内每个样本单独统计专家使用率，再与门控分数结合
             if self.seq_aux:
-                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
-                ce = torch.zeros(
+                scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)  # [bsz, seq_len, n_routed_experts]
+                # ce[b,i] = 样本 b 中专家 i 被选中的次数，再除以 (seq_len*top_k/n_routed_experts)，使理想均匀时 ce 全为 1
+                ce = torch.zeros(  # [bsz, n_routed_experts]
                     bsz, self.n_routed_experts, device=hidden_states.device
                 )
                 ce.scatter_add_(
                     1,
-                    topk_idx_for_aux_loss,
-                    torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device),
-                ).div_(seq_len * aux_topk / self.n_routed_experts)
+                    topk_idx_for_aux_loss,  # 列索引：专家 id
+                    torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device),  # 每次选中加 1
+                ).div_(seq_len * aux_topk / self.n_routed_experts)  # 归一化：均匀时 ce[b,i]=1
+                # 每个样本的损失：sum_i( ce[b,i] * mean_over_seq(scores[b,:,i]) )，再对 b 取平均，乘 alpha
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(
                     dim=1
-                ).mean() * self.alpha
+                ).mean() * self.alpha  # 标量
+            # 样本级辅助损失（seq_aux=False）：在整个 batch 上统计专家使用频率，与门控平均分数结合
             else:
+                # one-hot：每个 (batch,seq,top_k) 位置选中的专家记为 1
                 mask_ce = F.one_hot(
                     topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
-                )
-                ce = mask_ce.float().mean(0)
-                Pi = scores_for_aux.mean(0)
-                fi = ce * self.n_routed_experts
-                aux_loss = (Pi * fi).sum() * self.alpha
+                )  # [bsz*seq_len*top_k, n_routed_experts]
+                ce = mask_ce.float().mean(0)  # [n_routed_experts]，专家 i 被选中的全局比例 f_i
+                Pi = scores_for_aux.mean(0)  # [n_routed_experts]，门控对专家 i 的平均分数 P_i
+                fi = ce * self.n_routed_experts  # 均匀时 f_i=1/n，故 f_i*N=1；负载高时 >1
+                # 辅助项：sum_i P_i * f_i * N，鼓励 P 与 f 一致（负载均衡）
+                aux_loss = (Pi * fi).sum() * self.alpha  # 标量
         else:
-            aux_loss = scores.new_zeros(1).squeeze()
+            aux_loss = scores.new_zeros(1).squeeze()  # 标量 0，推理或不启用辅助损失时
         return topk_idx, topk_weight, aux_loss
 
 
@@ -488,65 +521,70 @@ class MoEFeedForward(nn.Module):  # ！修正：原MoEFeedForaward拼写错误
             )
 
     def forward(self, x):
+        # 输入 x: [bsz, seq_len, hidden_size]
         identity = x
         orig_shape = x.shape
         bsz, seq_len, h = orig_shape
 
-        # 门控：得到每个 token 的 top_k 专家索引与权重
+        # 门控：topk_idx [bsz*seq_len, top_k], topk_weight [bsz*seq_len, top_k], aux_loss 标量
         topk_idx, topk_weight, aux_loss = self.gate(x)
-        x = x.view(-1, x.shape[-1])  # [bsz*seq, hidden]
+        x = x.view(-1, x.shape[-1])  # [bsz*seq_len, hidden_size]
 
-        flat_topk_idx = topk_idx.view(-1)  # [bsz*seq*top_k]，每个元素为专家 id
+        flat_topk_idx = topk_idx.view(-1)  # [bsz*seq_len*top_k]，每个元素为专家 id (0..n_routed_experts-1)
         if self.training:
-            # 训练：按 token 复制 top_k 份，每个 token 对应 top_k 个专家输入
+            # 训练：每个 token 复制 top_k 份，送入对应专家；x 变为 [bsz*seq_len*top_k, hidden_size]
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
-            y = torch.empty_like(x, dtype=x.dtype)
+            y = torch.empty_like(x, dtype=x.dtype)  # [bsz*seq_len*top_k, hidden_size]
             for i, expert in enumerate(self.experts):
-                expert_out = expert(x[flat_topk_idx == i])
+                expert_out = expert(x[flat_topk_idx == i])  # [该专家 token 数, hidden_size]
                 if expert_out.shape[0] > 0:
                     y[flat_topk_idx == i] = expert_out.to(y.dtype)
                 else:
                     y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(
                         p.sum() for p in expert.parameters()
                     )
-            # 按 topk_weight 对同一 token 的 top_k 个专家输出加权求和，再恢复 [bsz, seq, hidden]
+            # y: [bsz*seq_len*top_k, hidden] -> view [bsz*seq_len, top_k, hidden] * topk_weight [bsz*seq_len, top_k, 1] -> sum(dim=1) -> [bsz*seq_len, hidden]
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
-            y = y.view(*orig_shape)
+            y = y.view(*orig_shape)  # [bsz, seq_len, hidden_size]
         else:
             y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(
                 *orig_shape
-            )
+            )  # moe_infer 输出 [bsz*seq_len, hidden_size]
         if self.config.n_shared_experts > 0:
             for expert in self.shared_experts:
-                y = y + expert(identity)
+                y = y + expert(identity)  # identity: [bsz, seq_len, hidden_size]
         self.aux_loss = aux_loss
-        return y
+        return y  # [bsz, seq_len, hidden_size]
 
     @torch.no_grad()
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
         """
         MoE 推理：按专家打包，每个专家一次性处理分到它的所有 token，再按原始 token 顺序 scatter 回结果。
-        x: [bsz*seq, hidden]；flat_expert_indices / flat_expert_weights: [bsz*seq*top_k]。
-        流程：argsort 将 token 按专家 id 排序 -> 按专家切段 -> 每段批量过对应 expert -> 加权 -> scatter_add 回 expert_cache。
+        输入：
+          x: [bsz*seq_len, hidden_size]
+          flat_expert_indices: [bsz*seq_len*top_k]，每个位置对应选中的专家 id
+          flat_expert_weights: [bsz*seq_len*top_k, 1] 或可广播形状，对应权重
+        输出：expert_cache [bsz*seq_len, hidden_size]，与 x 同形状。
+        流程：argsort 将 (token_idx, expert_id) 按专家 id 排序 -> 按专家切段 -> 每段批量过对应 expert -> 加权 -> scatter_add 回 expert_cache。
         """
-        expert_cache = torch.zeros_like(x)
-        idxs = flat_expert_indices.argsort()  # 排序后同一专家的 token 连续
-        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
-        token_idxs = idxs // self.config.num_experts_per_tok  # 排序后位置对应的原始 token 下标
+        expert_cache = torch.zeros_like(x)  # [bsz*seq_len, hidden_size]
+        idxs = flat_expert_indices.argsort()  # [bsz*seq_len*top_k]，排序后同一专家的条目连续
+        tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)  # 每个专家的累计 token 数
+        token_idxs = idxs // self.config.num_experts_per_tok  # [bsz*seq_len*top_k]，排序后位置对应的原始 token 下标
         for i, end_idx in enumerate(tokens_per_expert):
             start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
             if start_idx == end_idx:
                 continue
             expert = self.experts[i]
-            exp_token_idx = token_idxs[start_idx:end_idx]
-            expert_tokens = x[exp_token_idx]
-            expert_out = expert(expert_tokens).to(expert_cache.dtype)
-            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            exp_token_idx = token_idxs[start_idx:end_idx]  # 当前专家负责的 token 下标
+            expert_tokens = x[exp_token_idx]  # [当前专家 token 数, hidden_size]
+            expert_out = expert(expert_tokens).to(expert_cache.dtype)  # [当前专家 token 数, hidden_size]
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])  # 逐 token 乘权重
             expert_cache.scatter_add_(
                 0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out
-            )
+            )  # 按原始 token 下标加回 expert_cache
 
-        return expert_cache
+        return expert_cache  # [bsz*seq_len, hidden_size]
 
 
 class MokioMindBlock(nn.Module):
@@ -570,7 +608,7 @@ class MokioMindBlock(nn.Module):
         self.mlp = (
             FeedForward(config)
             if not config.use_moe
-            else MoEFeedForward(config)  # ！修正：原MoEFeedForaward拼写错误
+            else MoEFeedForward(config)
         )
 
     def forward(
@@ -581,22 +619,26 @@ class MokioMindBlock(nn.Module):
         use_cache=False,
         attention_mask: Optional[torch.Tensor] = None,
     ):
+        # 输入 hidden_states: [bsz, seq_len, hidden_size]；position_embeddings: (cos, sin) 各 [cur_len, head_dim]
+        # past_key_value: 单层 KV cache，(K, V) 或 None；K/V 形状 [bsz, past_len, n_kv_heads, head_dim]
         res = hidden_states
 
+        # pre-norm: RMSNorm 不改变形状；Attention 输入/输出均为 [bsz, seq_len, hidden_size]
         hidden_states, present_key_value = self.self_attention(
-            self.input_layernorm(hidden_states),  # pre-norm
+            self.input_layernorm(hidden_states),
             position_embeddings,
             past_key_value,
             use_cache,
             attention_mask,
         )
 
-        hidden_states = res + hidden_states
+        hidden_states = res + hidden_states  # 残差 [bsz, seq_len, hidden_size]
 
+        # pre-norm + MLP/MoE + 残差；mlp 输入/输出 [bsz, seq_len, hidden_size]
         hidden_states = hidden_states + self.mlp(
             self.post_attention_layernorm(hidden_states)
         )
-        return hidden_states, present_key_value
+        return hidden_states, present_key_value  # present_key_value: (K, V) 或 None；K/V 形状 [bsz, total_len, n_kv_heads, head_dim]，total_len=past_len+seq_len
 
 
 class MokioMindModel(nn.Module):
@@ -637,7 +679,9 @@ class MokioMindModel(nn.Module):
         use_cache: bool = False,
         **kwargs,
     ):
-        # input_ids: [bsz, seq_len]
+        # 输入 input_ids: [bsz, seq_len]，attention_mask: [bsz, seq_len] 或 [bsz, total_len]（1=有效，0=pad）
+        # past_key_values: 长度为 num_hidden_layers 的列表，第 l 项为 (K_l, V_l) 或 None；
+        #   每层 K/V 形状为 [bsz, past_len, n_kv_heads, head_dim]，past_len 为已缓存的序列长度（首次为 0）
         batch_size, seq_length = input_ids.shape
 
         if hasattr(past_key_values, "layers"):
@@ -645,17 +689,17 @@ class MokioMindModel(nn.Module):
 
         past_key_values = past_key_values or [None] * len(self.layers)
 
-        # 计算start_pos：如果存在past，则start_pos为已有past序列长度
+        # start_pos：已有 KV 的序列长度；past_key_values[l][0] 为 K，形状 [bsz, past_len, n_kv_heads, head_dim]，取 .shape[1] 得 past_len
         start_pos = (
             past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         )
 
-        # Embedding + dropout：input_ids [bsz, seq_len] -> [bsz, seq_len, hidden]
+        # Embedding：input_ids [bsz, seq_len] -> embed_tokens -> [bsz, seq_len, hidden_size]；dropout 不改变形状
         hidden_states = self.dropout(
             self.embed_tokens(input_ids)
         )
 
-        # 当前步使用的 RoPE 片段，形状 [seq_length, head_dim]
+        # 当前步 RoPE 片段：从预计算的 freqs_cos/freqs_sin 中切片，各 [seq_length, head_dim]
         position_embeddings = (
             self.freqs_cos[start_pos : start_pos + seq_length],
             self.freqs_sin[start_pos : start_pos + seq_length],
@@ -671,10 +715,11 @@ class MokioMindModel(nn.Module):
                 use_cache=use_cache,
                 attention_mask=attention_mask,
             )
-            presents.append(present)
+            presents.append(present)  # present: (K, V) 或 None；K/V 形状 [bsz, total_len, n_kv_heads, head_dim]，total_len=past_len+seq_len
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)  # [bsz, seq_len, hidden_size]
 
+        # MoE 负载均衡辅助损失：仅当使用 MoEFeedForward 的层才有 aux_loss（标量）
         aux_loss = sum(
             [
                 layer.mlp.aux_loss
@@ -686,14 +731,15 @@ class MokioMindModel(nn.Module):
             hidden_states.new_zeros(1).squeeze(),
         )
 
-        return hidden_states, presents, aux_loss
+        return hidden_states, presents, aux_loss  # presents: 长度为 num_hidden_layers，每项 (K,V) 中 K/V 为 [bsz, total_len, n_kv_heads, head_dim]
 
 
 class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
     """
     因果语言模型：MokioMindModel + lm_head；embed_tokens 与 lm_head 权重共享（同一 Linear weight）。
-    前向：input_ids -> model -> hidden_states -> lm_head(hidden_states[:, slice, :]) -> logits [bsz, kept, vocab_size]。
-    logits_to_keep：生成时通常只保留最后一步，训练时可保留整段；labels 存在时计算 CE loss（shift 后、ignore_index=-100）。
+    前向：input_ids [bsz, seq_len] -> model -> hidden_states [bsz, seq_len, hidden_size]
+         -> lm_head(hidden_states[:, slice, :]) -> logits [bsz, kept, vocab_size]。
+    logits_to_keep：生成时通常为 1（只保留最后一步），训练时可保留整段；labels [bsz, seq_len] 存在时计算 CE loss（shift 后、ignore_index=-100）。
     """
     config_class = MokioMindConfig
 
@@ -713,6 +759,8 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         logits_to_keep: Union[int, torch.Tensor] = 0,
         **args,
     ):
+        # past_key_values 入参/出参形状：List of length num_hidden_layers，每层 (K, V)，K/V 为 [bsz, past_len或total_len, n_kv_heads, head_dim]
+        # model 返回 hidden_states [bsz, seq_len, hidden_size], past_key_values（同上形状）, aux_loss
         hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -722,21 +770,23 @@ class MokioMindForCausalLM(PreTrainedModel, GenerationMixin):
         )
 
         # 只对最后 logits_to_keep 个位置做 lm_head（生成时多为 1），减少计算
+        # hidden_states[:, slice_indices, :]: [bsz, kept, hidden_size]
         slice_indices = (
             slice(-logits_to_keep, None)
             if isinstance(logits_to_keep, int)
             else logits_to_keep
         )
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = self.lm_head(hidden_states[:, slice_indices, :])  # [bsz, kept, vocab_size]
 
         loss = None
         if labels is not None:
-            # 自回归：预测下一个 token，shift_logits 与 shift_labels 对齐
+            # 自回归：预测下一个 token；labels [bsz, seq] 与 input 对齐，shift 后与 logits 对齐
+            # shift_logits: [bsz, kept-1, vocab_size]，shift_labels: [bsz, kept-1]（或与 logits 第二维一致）
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
             loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
+                shift_logits.view(-1, shift_logits.size(-1)),  # [bsz*(kept-1), vocab_size]
+                shift_labels.view(-1),  # [bsz*(kept-1)]
                 ignore_index=-100,
             )
 
