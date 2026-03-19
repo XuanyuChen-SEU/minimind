@@ -76,25 +76,26 @@ def train_epoch(
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        with autocast_ctx:
+        with autocast_ctx:  # 混合精度上下文（自动用 FP16 计算，FP32 存梯度）
             res = model(input_ids, attention_mask=attention_mask, labels=labels)
-            loss = res.loss  # 预训练不加 MoE aux_loss
-            loss = loss / args.accumulation_steps
+            loss = res.loss  # 预训练损失（如 CE 损失）
+            loss = loss / args.accumulation_steps  # 梯度累积：损失均分
 
-        scaler.scale(loss).backward()
+        scaler.scale(loss).backward()  # 缩放损失，避免 FP16 下溢
+
 
         if (step + 1) % args.accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.unscale_(optimizer)  # 反缩放梯度（为了梯度裁剪）
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)  # 梯度裁剪
             
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.step(optimizer)  # 更新优化器（自动处理混合精度）
+            scaler.update()  # 更新缩放器状态
 
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True)  # 清空梯度（set_to_none=True 更省显存）
 
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps
+            current_loss = loss.item() * args.accumulation_steps # 还原真实损失（因为之前除以了累积步数）
             current_lr = optimizer.param_groups[-1]["lr"]
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
 
@@ -108,34 +109,35 @@ def train_epoch(
                     {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
                 )
 
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
-            model.eval()
+            if (step % args.save_interval == 0 or step == iters) and is_main_process():
+                model.eval()  # 切换到评估模式（避免 Dropout/BatchNorm 影响权重）
 
-            moe_suffix = (
-                "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
-            )
-            ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+                # 生成 MoE 模型的文件名后缀
+                moe_suffix = "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
+                ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
 
-            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                state_dict = model.module.state_dict()
-            else:
-                state_dict = model.state_dict()
-            state_dict = {k: v.half() for k, v in state_dict.items()}
-            torch.save(state_dict, ckp)
+                # 处理 DDP 模型，获取真实 state_dict（去掉 module. 前缀）
+                if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+                    state_dict = model.module.state_dict()
+                else:
+                    state_dict = model.state_dict()
+                state_dict = {k: v.half() for k, v in state_dict.items()}  # 转为 FP16，减小文件体积
+                torch.save(state_dict, ckp)  # 保存纯模型权重（用于推理/部署）
 
-            lm_checkpoint(
-                lm_config,
-                weight=args.save_weight,
-                model=model,
-                optimizer=optimizer,
-                scaler=scaler,
-                epoch=epoch,
-                step=step,
-                wandb=wandb,
-                save_dir="../checkpoints",
-            )
+                # 保存完整检查点（用于断点续训）
+                lm_checkpoint(
+                    lm_config,
+                    weight=args.save_weight,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch,
+                    step=step,
+                    wandb=wandb,
+                    save_dir="../checkpoints",
+                )
 
-            model.train()
+                model.train()  # 切回训练模式
 
 
 if __name__ == "__main__":
@@ -144,7 +146,7 @@ if __name__ == "__main__":
     # ========== 基础训练参数 ==========
     parser.add_argument(
         "--save_dir", type=str, default="../out", help="模型保存目录"
-    )  # ！修正：原"out"缺少../前缀
+    )
     parser.add_argument(
         "--save_weight", default="pretrain", type=str, help="保存权重的前缀名"
     )
