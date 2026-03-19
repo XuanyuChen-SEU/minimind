@@ -409,7 +409,7 @@ class DPODataset(Dataset):
         y_rejected = torch.tensor(rejected_input_ids[1:], dtype=torch.long)
         mask_rejected = torch.tensor(rejected_loss_mask[1:], dtype=torch.long)
 
-        # ！修正：返回 attention_mask，使 attention 层能屏蔽 padding token
+        # 返回 attention_mask，使 attention 层能屏蔽 padding token
         attention_mask_chosen = (
             torch.tensor(chosen_input_ids[:-1], dtype=torch.long) != self.padding
         ).long()
