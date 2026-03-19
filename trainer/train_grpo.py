@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 import re
@@ -15,6 +17,8 @@ from transformers import AutoTokenizer, AutoModel
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from typing import Any, List, Optional
+
 from model.model import MokioMindConfig
 from dataset.lm_dataset import RLAIFDataset
 from trainer.trainer_utils import (
@@ -30,8 +34,13 @@ from trainer.trainer_utils import (
 warnings.filterwarnings("ignore")
 
 
-def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
-    def reasoning_model_reward(rewards_tensor):
+def calculate_rewards(
+    prompts: List[str],
+    responses: List[str],
+    reward_model: Any,
+    reward_tokenizer: Any,
+) -> torch.Tensor:
+    def reasoning_model_reward(rewards_tensor: torch.Tensor) -> torch.Tensor:
         pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
         pattern2 = r"^<think>\n.*?\n</think>\n\n<answer>\n.*?\n</answer>$"
 
@@ -105,15 +114,15 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
 
 
 def grpo_train_epoch(
-    epoch,
-    loader,
-    iters,
-    ref_model,
-    reward_model,
-    reward_tokenizer,
-    start_step=0,
-    wandb=None,
-):
+    epoch: int,
+    loader: DataLoader,
+    iters: int,
+    ref_model: Any,
+    reward_model: Any,
+    reward_tokenizer: Any,
+    start_step: int = 0,
+    wandb: Optional[Any] = None,
+) -> None:
     for step, batch in enumerate(loader, start=start_step + 1):
         prompts = batch["prompt"]
 

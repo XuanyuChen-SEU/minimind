@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 import os
 import sys
 
 # 📚 Python模块系统
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from typing import Any, List, Optional
 
 import argparse  # 命令行参数解析
 import re  # 正则表达式，用于奖励计算
@@ -36,12 +40,17 @@ warnings.filterwarnings("ignore")
 
 
 class CriticModel(MokioMindForCausalLM):
-    def __init__(self, params):
+    def __init__(self, params: MokioMindConfig) -> None:
         super().__init__(params)
         # 价值头，用于输出每个token位置的状态价值
         self.value_head = nn.Linear(params.hidden_size, 1)
 
-    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
         outputs = self.model(
             input_ids=input_ids, attention_mask=attention_mask, **kwargs
         )
@@ -52,8 +61,13 @@ class CriticModel(MokioMindForCausalLM):
 
 
 # ==========奖励计算部分==========
-def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
-    def reasoning_model_reward(rewards):
+def calculate_rewards(
+    prompts: List[str],
+    responses: List[str],
+    reward_model: Any,
+    reward_tokenizer: Any,
+) -> torch.Tensor:
+    def reasoning_model_reward(rewards_tensor: torch.Tensor) -> torch.Tensor:
         # 使用正则表达式匹配思考-回答格式
         pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
         # 多了一个\n，考虑到think和answer之间有空行的情况
@@ -72,7 +86,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
                 format_rewards.append(0.5)
             else:
                 format_rewards.append(0.0)
-        rewards += torch.tensor(format_rewards, device=args.device)
+        rewards_tensor += torch.tensor(format_rewards, device=args.device)
 
         def mark_num(text):
             reward = 0
@@ -87,8 +101,8 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
             return reward
 
         mark_rewards = [mark_num(response) for response in responses]
-        rewards += torch.tensor(mark_rewards, device=args.device)
-        return rewards
+        rewards_tensor += torch.tensor(mark_rewards, device=args.device)
+        return rewards_tensor
 
     rewards = torch.zeros(len(responses), device=args.device)
 
@@ -134,18 +148,18 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer):
 
 # ==========PPO训练一个Epoch部分==========
 def ppo_train_epoch(
-    epoch,
-    loader,
-    iters,
-    old_actor_model,
-    ref_model,
-    actor_scheduler,
-    critic_scheduler,
-    reward_model,
-    reward_tokenizer,
-    start_step=0,
-    wandb=None,
-):
+    epoch: int,
+    loader: DataLoader,
+    iters: int,
+    old_actor_model: Any,
+    ref_model: Any,
+    actor_scheduler: Any,
+    critic_scheduler: Any,
+    reward_model: Any,
+    reward_tokenizer: Any,
+    start_step: int = 0,
+    wandb: Optional[Any] = None,
+) -> None:
     # 切换actor和critic模型到训练模式
     actor_model.train()
     critic_model.train()

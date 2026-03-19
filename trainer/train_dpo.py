@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 import os
 import sys
 
 # 📚 Python模块系统
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from typing import Any, Optional
 
 import argparse  # 命令行参数解析
 import time  # 时间统计
@@ -30,7 +34,7 @@ from trainer.trainer_utils import (  # 训练工具函数
 )
 
 
-def logits_to_log_probs(logits, labels):
+def logits_to_log_probs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     # 词表logits转换为log概率
     log_probs = F.log_softmax(logits, dim=2)
     # 从log词表概率里选出label对应的log概率
@@ -45,7 +49,12 @@ def logits_to_log_probs(logits, labels):
 
 # DPO的loss计算
 # 公式：L = -log(σ(β * (π(y_w) - π(y_l) - (π_ref(y_w) - π_ref(y_l)))))
-def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
+def dpo_loss(
+    ref_log_probs: torch.Tensor,
+    policy_log_probs: torch.Tensor,
+    mask: torch.Tensor,
+    beta: float,
+) -> torch.Tensor:
     seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(
         1e-8
     )  # ！修正：原clamp_min断裂为独立一行，导致NameError
@@ -70,8 +79,15 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
 
 
 def train_epoch(
-    epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=None, beta=0.1
-):
+    epoch: int,
+    loader: DataLoader,
+    iters: int,
+    ref_model: Any,
+    lm_config: MokioMindConfig,
+    start_step: int = 0,
+    wandb: Optional[Any] = None,
+    beta: float = 0.1,
+) -> None:
     start_time = time.time()
     for step, batch in enumerate(loader, start=start_step + 1):
         x_chosen = batch["x_chosen"].to(args.device)
