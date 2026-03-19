@@ -56,6 +56,7 @@ class CriticModel(MokioMindForCausalLM):
         )
         hidden_states = self.model.norm(outputs[0])
 
+        # hidden_states: [B, L, H] → values: [B, L]（每位置一个标量价值）
         values = self.value_head(hidden_states).squeeze(-1)
         return values
 
@@ -67,6 +68,7 @@ def calculate_rewards(
     reward_model: Any,
     reward_tokenizer: Any,
 ) -> torch.Tensor:
+    """返回每条 (prompt, response) 的标量奖励，形状 [B]，B = len(responses)。"""
     def reasoning_model_reward(rewards_tensor: torch.Tensor) -> torch.Tensor:
         # 使用正则表达式匹配思考-回答格式
         pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
@@ -160,13 +162,23 @@ def ppo_train_epoch(
     start_step: int = 0,
     wandb: Optional[Any] = None,
 ) -> None:
-    # 切换actor和critic模型到训练模式
+    """
+    关键张量形状（B = batch 内 prompt 条数，P = prompt 长度（padding 后），R = 生成长度，
+    L = P + R = gen_out.size(1)，V = vocab_size）：
+
+      - enc.input_ids / attention_mask: [B, P]；prompt_lengths: [B]
+      - gen_out: [B, L]（prompt + 续写，右 pad）
+      - full_mask: [B, L]；value_seq（critic）: [B, L]；values（末有效位）: [B]
+      - rewards / advantages: [B]
+      - logits（actor/old/ref）: [B, L, V]；labels = gen_out[:,1:]: [B, L-1]
+      - logp_tokens / old_logp_tokens / ref_logp_tokens: [B, L-1]；final_mask 同形
+      - actor_logp / old_logp / ref_logp / ratio: [B]；policy 相关 loss 为标量
+    """
     actor_model.train()
     critic_model.train()
 
     for step, batch in enumerate(loader, start=start_step + 1):
         prompts = batch["prompt"]
-        # 编码输入
         enc = tokenizer(
             prompts,
             return_tensors="pt",
@@ -174,8 +186,7 @@ def ppo_train_epoch(
             truncation=True,
             max_length=args.max_seq_len,
         ).to(args.device)
-        # 计算每个prompt的长度（用于后续处理）
-        prompt_lengths = enc.attention_mask.sum(dim=1)
+        prompt_lengths = enc.attention_mask.sum(dim=1)  # [B]，每条 prompt 非 pad 长度
 
         with torch.no_grad():
             model_for_gen = (
@@ -193,8 +204,8 @@ def ppo_train_epoch(
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
+        # gen_out: [B, P+R]
 
-        # 解码生成的响应
         responses_text = [
             tokenizer.decode(gen_out[i, prompt_lengths[i] :], skip_special_tokens=True)
             for i in range(len(prompts))
@@ -205,15 +216,10 @@ def ppo_train_epoch(
             prompts, responses_text, reward_model, reward_tokenizer
         )
 
-        # 创建一个mask，用于标记哪些位置上是有效token
-        full_mask = (gen_out != tokenizer.pad_token_id).long()
-        # critic模型进行价值估计
-        value_seq = critic_model(input_ids=gen_out, attention_mask=full_mask)
-        # 拿到最后一个非pad位置的索引
-        last_indices = full_mask.sum(dim=1) - 1
-        # 获取每条序列最后token的value
-        values = value_seq[torch.arange(len(last_indices)), last_indices]
-        # advantage=reward-估计的value
+        full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, L]
+        value_seq = critic_model(input_ids=gen_out, attention_mask=full_mask)  # [B, L]
+        last_indices = full_mask.sum(dim=1) - 1  # [B]
+        values = value_seq[torch.arange(len(last_indices)), last_indices]  # [B]
         advantages = rewards - values.detach()  # [B]
 
         # 计算actor log，表示actor对这个答案的“信心”

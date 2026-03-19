@@ -40,6 +40,8 @@ def calculate_rewards(
     reward_model: Any,
     reward_tokenizer: Any,
 ) -> torch.Tensor:
+    """与 grpo 中 batch_decode 顺序一致，每条 completion 一个标量，形状 [B*G]（B=len(prompts)，G=num_generations）。"""
+
     def reasoning_model_reward(rewards_tensor: torch.Tensor) -> torch.Tensor:
         pattern = r"^<think>\n.*?\n</think>\n<answer>\n.*?\n</answer>$"
         pattern2 = r"^<think>\n.*?\n</think>\n\n<answer>\n.*?\n</answer>$"
@@ -123,6 +125,17 @@ def grpo_train_epoch(
     start_step: int = 0,
     wandb: Optional[Any] = None,
 ) -> None:
+    """
+    关键张量形状（B = DataLoader batch 内 prompt 条数，G = num_generations，P = prompt 长度（padding 后），
+    R = max_new_tokens，L = P + R，V = vocab_size）：
+
+      - prompt_inputs["input_ids"]: [B, P]
+      - outputs（generate）: [B*G, L]，每条 prompt 重复采样 G 次沿 batch 维展开
+      - completion_ids: [B*G, R]，仅生成段（去掉 prompt 前缀）
+      - per_token_logps / ref_per_token_logps: [B*G, R]，completion 上逐 token log π
+      - rewards: [B*G]；grouped_rewards: [B, G]；mean_r/std_r/advantages: [B*G]
+      - completion_mask: [B*G, R]；per_token_kl / per_token_loss: [B*G, R]
+    """
     for step, batch in enumerate(loader, start=start_step + 1):
         prompts = batch["prompt"]
 
@@ -155,7 +168,7 @@ def grpo_train_epoch(
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
-
+        # outputs: [B*G, P+R]；completion_ids: [B*G, R]
         completion_ids = outputs[:, prompt_inputs["input_ids"].size(1) :]
 
         def get_per_token_logps(mdl, input_ids, n_keep):
@@ -174,26 +187,27 @@ def grpo_train_epoch(
                     logits_row.log_softmax(dim=-1), 1, ids_row.unsqueeze(1)
                 ).squeeze(1)
                 per_token_logps.append(token_logps)
-            return torch.stack(per_token_logps)
+            return torch.stack(per_token_logps)  # [batch_of_input_ids, n_keep]
 
         per_token_logps = get_per_token_logps(model, outputs, completion_ids.size(1))
         with torch.no_grad():
             ref_per_token_logps = get_per_token_logps(
                 ref_model, outputs, completion_ids.size(1)
             )
+        # 此处 input_ids 为 outputs，batch = B*G → 二者均为 [B*G, R]
 
         completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
         rewards = calculate_rewards(
             prompts, completions, reward_model, reward_tokenizer
-        ).to(args.device)
+        ).to(args.device)  # [B*G]
 
-        grouped_rewards = rewards.view(-1, args.num_generations)
+        grouped_rewards = rewards.view(-1, args.num_generations)  # [B, G]
         mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)
         std_r = grouped_rewards.std(dim=1).repeat_interleave(args.num_generations)
-        advantages = torch.clamp((rewards - mean_r) / (std_r + 1e-4), -10, 10)
+        advantages = torch.clamp((rewards - mean_r) / (std_r + 1e-4), -10, 10)  # [B*G]
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        is_eos = completion_ids == tokenizer.eos_token_id
+        is_eos = completion_ids == tokenizer.eos_token_id  # [B*G, R]
         eos_idx = torch.full(
             (is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=args.device
         )
@@ -203,8 +217,9 @@ def grpo_train_epoch(
             <= eos_idx.unsqueeze(1)
         ).int()
 
-        kl_div = ref_per_token_logps - per_token_logps
+        kl_div = ref_per_token_logps - per_token_logps  # [B*G, R]
         per_token_kl = torch.exp(kl_div) - kl_div - 1
+        # advantages.unsqueeze(1): [B*G, 1]，与 [B*G, R] 广播
         per_token_loss = -(
             torch.exp(per_token_logps - per_token_logps.detach())
             * advantages.unsqueeze(1)

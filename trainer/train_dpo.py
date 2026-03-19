@@ -35,15 +35,23 @@ from trainer.trainer_utils import (  # 训练工具函数
 
 
 def logits_to_log_probs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    # 词表logits转换为log概率
+    """
+    将词表 logits 转为每个位置对「下一 token」的 log 概率，并按 labels 取出对应 token 的 log p。
+
+    形状约定（B=batch，S=序列长度-1，与 train_epoch 中 x/y 对齐）：
+      - logits: [B, S, vocab_size]
+      - labels: [B, S]，与 logits 同一位置对齐（自回归：位置 t 预测 labels[t]）
+      - 返回:   [B, S]，每个 (b,s) 为 log π(y_{b,s} | x_{b,:s+1})
+    """
+    # log_softmax归一化：把logits转为对数概率（保证每个位置的词表概率和为1）
+    # 输入[B,S,V] → 输出[B,S,V]
     log_probs = F.log_softmax(logits, dim=2)
-    # 从log词表概率里选出label对应的log概率
-    # 也就是从拿到token在其对应位置的概率
+    # labels.unsqueeze(2) → [B,S] → [B,S,1]（扩展维度匹配log_probs的前两维）
+    # torch.gather(dim=2) → 按词表维度，根据labels的索引取值 → 输出[B,S,1]
+    # squeeze(-1) → 去掉最后一维 → 输出[B,S]
     log_probs_per_token = torch.gather(
         log_probs, dim=2, index=labels.unsqueeze(2)
-    ).squeeze(
-        -1
-    )  # ！修正：原.unsqueeze(-1)导致维度错误[B,S,1,1]，应用.squeeze(-1)降维到[B,S]
+    ).squeeze(-1)
     return log_probs_per_token
 
 
@@ -55,9 +63,18 @@ def dpo_loss(
     mask: torch.Tensor,
     beta: float,
 ) -> torch.Tensor:
+    """
+    在 mask 指示的 token 上平均后，对 chosen/rejected 两半 batch 做 log-ratio 差分。
+
+    输入形状（合并 chosen+rejected 后，batch 维为 2*B_half）：
+      - ref_log_probs / policy_log_probs: [2*B_half, S]，与 logits_to_log_probs 输出一致
+      - mask: [2*B_half, S]，1=计入 DPO 的 assistant 回复 token，0=忽略
+    中间：按行求均值后得到 [2*B_half]，再拆成前 B_half 为 chosen、后 B_half 为 rejected。
+    返回：标量 loss（再与 aux_loss 等组合）。
+    """
     seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(
         1e-8
-    )  # ！修正：原clamp_min断裂为独立一行，导致NameError
+    )
     # 计算ref和policy的序列log概率均值
     ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
     policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
@@ -88,6 +105,15 @@ def train_epoch(
     wandb: Optional[Any] = None,
     beta: float = 0.1,
 ) -> None:
+    """
+    每个 step 的 batch 来自 DPODataset（单条样本内 chosen/rejected 再 cat 成一条大 batch）：
+
+      - x_chosen / x_rejected: [B, S]，S = max_length - 1（自回归输入）
+      - y_chosen / y_rejected: [B, S]，与 x 错位一位的目标 token
+      - mask_* / attention_mask_*: [B, S]，与 y 对齐
+      - x / y / mask / attention_mask: [2*B, S]，dim=0 前半为 chosen、后半为 rejected
+      - ref_logits / logits: [2*B, S, vocab_size] → ref_log_probs / policy_log_probs: [2*B, S]
+    """
     start_time = time.time()
     for step, batch in enumerate(loader, start=start_step + 1):
         x_chosen = batch["x_chosen"].to(args.device)
@@ -98,17 +124,18 @@ def train_epoch(
         mask_rejected = batch["mask_rejected"].to(args.device)
         attention_mask_chosen = batch["attention_mask_chosen"].to(
             args.device
-        )  # ！修正：加入attention_mask
+        ) 
         attention_mask_rejected = batch["attention_mask_rejected"].to(
             args.device
-        )  # ！修正：加入attention_mask
+        )
 
+        # [2*B, S]：B = batch_size，S = max_seq_len - 1
         x = torch.cat([x_chosen, x_rejected], dim=0)
         y = torch.cat([y_chosen, y_rejected], dim=0)
         mask = torch.cat([mask_chosen, mask_rejected], dim=0)
         attention_mask = torch.cat(
             [attention_mask_chosen, attention_mask_rejected], dim=0
-        )  # ！修正：合并attention_mask
+        )
 
         # 📚 学习率调度
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
@@ -119,25 +146,20 @@ def train_epoch(
             # 📚 参考模型前向传播
             # 参考模型冻结，只用于计算baseline概率
             with torch.no_grad():
-                ref_outputs = ref_model(
-                    x, attention_mask=attention_mask
-                )  # ！修正：加入attention_mask
+                ref_outputs = ref_model(x, attention_mask=attention_mask)
+                # ref_logits: [2*B, S, vocab_size]（与 MokioMindForCausalLM 输出一致）
                 ref_logits = ref_outputs.logits
-            ref_log_probs = logits_to_log_probs(ref_logits, y)
+            ref_log_probs = logits_to_log_probs(ref_logits, y)  # [2*B, S]
 
-            # 📚 策略模型前向传播
-            # 策略模型是需要优化的主要模型
-            outputs = model(
-                x, attention_mask=attention_mask
-            )  # ！修正：加入attention_mask
-            logits = outputs.logits
-            policy_log_probs = logits_to_log_probs(logits, y)
+            outputs = model(x, attention_mask=attention_mask)
+            logits = outputs.logits  # [2*B, S, vocab_size]
+            policy_log_probs = logits_to_log_probs(logits, y)  # [2*B, S]
 
             # 📚 DPO损失计算
             dpo_loss_val = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
             loss = (
                 dpo_loss_val + outputs.aux_loss
-            )  # ！修正：原缺少aux_loss，MoE辅助损失被丢弃
+            )
             loss = loss / args.accumulation_steps
 
         # 📚 反向传播
