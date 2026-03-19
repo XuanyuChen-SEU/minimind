@@ -76,7 +76,9 @@ def train_epoch(
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        with autocast_ctx:  # 混合精度上下文（自动用 FP16 计算，FP32 存梯度）
+        with autocast_ctx: 
+            # 在上下文范围内自动将模型的计算和数据在 FP32（单精度）和 FP16（半精度）之间切换
+            # 以在保证精度的前提下提升训练 / 推理速度、降低显存占用。
             res = model(input_ids, attention_mask=attention_mask, labels=labels)
             loss = res.loss  # 预训练损失（如 CE 损失）
             loss = loss / args.accumulation_steps  # 梯度累积：损失均分
@@ -95,7 +97,7 @@ def train_epoch(
 
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps # 还原真实损失（因为之前除以了累积步数）
+            current_loss = loss.item() * args.accumulation_steps  # 恢复真实损失值，把梯度累积的缩放乘回来
             current_lr = optimizer.param_groups[-1]["lr"]
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
 
@@ -314,3 +316,5 @@ if __name__ == "__main__":
                 pin_memory=True,
             )
             train_epoch(epoch, loader, len(loader), 0, wandb)
+    if dist.is_initialized():
+        dist.destroy_process_group()
