@@ -25,7 +25,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.model import MokioMindConfig, MokioMindForCausalLM
-# from model.model_lora import apply_lora, load_lora  # ！修正：原缺少LoRA加载支持
+from model.model_lora import apply_lora, load_lora
 from trainer.trainer_utils import setup_seed
 
 warnings.filterwarnings("ignore")
@@ -49,7 +49,7 @@ def init_model(args):
                 num_hidden_layers=args.num_hidden_layers,
                 use_moe=bool(
                     args.use_moe
-                ),  # ！修正：原缺少use_moe参数，MoE模型无法正确加载
+                ),
                 inference_rope_scaling=args.inference_rope_scaling,
             )
         )
@@ -58,9 +58,7 @@ def init_model(args):
         # state_dict 中 key 与 model.state_dict() 完全一致时 strict=True 才通过
         model.load_state_dict(
             torch.load(ckp, map_location=args.device), strict=True
-        )  # ！修正：原strict=False会静默忽略丢失/多余的权重键
-
-        # ！修正：原缺少LoRA加载逻辑（需取消顶部 apply_lora/load_lora 注释）
+        )
         if args.lora_weight != "None":
             apply_lora(model)
             load_lora(
@@ -73,7 +71,7 @@ def init_model(args):
             args.load_from, trust_remote_code=True
         )
     print(
-        f"MokioMind模型参数: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M(illion)"  # ！修正：原残留MiniMind命名
+        f"MokioMind模型参数: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M(illion)"
     )
     return model.eval().to(args.device), tokenizer
 
